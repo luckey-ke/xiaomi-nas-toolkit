@@ -1,0 +1,32 @@
+# 本地配置：含设备 IP / UID / 密码，绝不入库
+config/config.json
+config/*.local.json
+
+# 上游第三方代码与二进制：由 bootstrap 拉取，不进本仓库
+vendor/
+.cache/
+
+# 运行产物
+logs/
+*.log
+backup/
+*.tar.gz
+stage/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 私钥（万一被复制进来）
+*.pem
+id_*_*
+!id_*_*.pub

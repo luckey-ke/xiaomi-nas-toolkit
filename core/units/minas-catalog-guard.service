@@ -1,0 +1,13 @@
+[Unit]
+Description=MINAS plugin catalog guard
+After=network.target
+Before=minas.plugin_center.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /data/minas/plugins/catalog/catalog_guard.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

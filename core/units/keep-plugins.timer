@@ -1,0 +1,10 @@
+[Unit]
+Description=Run MINAS plugin self-heal at 08:00, 12:00, 15:00, 18:00
+
+[Timer]
+OnCalendar=*-*-* 08,12,15,18:00:00
+Persistent=true
+Unit=keep-plugins.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,43 @@
+{
+  "_comment": "复制为 config/config.json 后填写。只有 device.host 是必填项，uid 留空会自动从设备证书里解析。",
+
+  "device": {
+    "host": "",
+    "uid": "",
+    "sn": "",
+    "shell_port": 2323
+  },
+
+  "access": {
+    "cert_dir": "",
+    "ssh_port": 22,
+    "ssh_user": "root",
+    "key_path": "",
+    "root_password": "",
+    "allowed_ips": []
+  },
+
+  "plugins": {
+    "enabled": ["dockerctl", "sysmon", "pcbackup"],
+    "ports": {
+      "dockerctl": 9302,
+      "sysmon": 9301,
+      "pcbackup": 9303
+    },
+    "motrix": {
+      "image": "agalwood/motrix:latest",
+      "port": 9304
+    }
+  },
+
+  "selfheal": {
+    "mode": "calendar",
+    "calendar": "08,12,15,18:00",
+    "interval": "2min"
+  },
+
+  "upstream": {
+    "repo": "https://github.com/lvmaple/minas_plugin.git",
+    "ref": ""
+  }
+}

@@ -1,0 +1,9 @@
+[Unit]
+Description=MINAS plugin runtime self-heal
+After=network.target minas-catalog-guard.service
+Wants=minas-catalog-guard.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /data/minas-ssh/keep-plugins/keep-plugins.py
+TimeoutStartSec=180
