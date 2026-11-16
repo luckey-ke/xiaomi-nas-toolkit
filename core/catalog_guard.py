@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Local plugin catalog guard for Xiaomi NAS (v4).
+"""小米 NAS 本地插件目录守卫（v4）——本稳定性栈的核心。
 
-plugincenter judges any plugin missing from the cloud server.list as
-"taken down" and uninstalls it. This guard sits between plugincenter and the
-cloud: it forwards the catalog request, merges our self-developed plugins into
-the response, and fails closed (HTTP 503) when the cloud is unreachable so a
-failed update can never trigger deletion.
+背景：系统自带的 plugincenter 会定期从云端下载插件目录（server.list），
+凡是不在目录里的插件都会被判定为「已下架」并自动卸载。自研插件天然
+不在云端目录里，所以必须有人把守这道关。
 
-Listens on 127.0.0.1 only. The custom entries file holds server-list shaped
-records: {"<plugin>": {"info": ..., "resource": ...}}.
+工作方式：
+  1. 只监听 127.0.0.1， plugincenter 的目录请求被改道到这里；
+  2. 正常时转发请求到小米云端，拿到官方目录后把自研插件合并进去再返回；
+  3. 云端不可达或返回异常时，宁可返回 503 让本次更新失败（fail-closed），
+     也绝不交出不完整的目录——一次失败的更新不能演变成插件被删。
+
+自研插件条目放在 entries 文件里，格式与云端目录条目一致：
+  {"<插件名>": {"info": {...}, "resource": {...}}}
 """
 import json
 import os

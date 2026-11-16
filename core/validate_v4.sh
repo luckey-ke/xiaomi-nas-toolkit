@@ -68,11 +68,24 @@ echo "== 注册状态 =="
 python3 - "$USER_NAME" "$PLUGIN_IDS" <<'PY'
 import json, sys
 user, ids = sys.argv[1], sys.argv[2].split()
-ulist = json.load(open('/data/plugin/%s.list' % user, encoding='utf-8'))
-slist = json.load(open('/data/plugin/server.list', encoding='utf-8'))
+def load(path):
+    # 文件可能因 plugincenter「先截断后写入」而暂时为空，不能让验收崩在 traceback
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+ulist = load('/data/plugin/%s.list' % user) or {}
+sdata = (load('/data/plugin/server.list') or {}).get('data') or {}
+bad = []
 for name in ids:
-    print(name, 'user=', name in ulist, 'install=', (ulist.get(name) or {}).get('install'),
-          'server=', name in slist.get('data', {}))
+    install = (ulist.get(name) or {}).get('install')
+    print(name, 'user=', name in ulist, 'install=', install, 'server=', name in sdata)
+    if name not in ulist or install is not True or name not in sdata:
+        bad.append(name)
+if bad:
+    print('FAIL: 注册状态异常：%s（若 server.list 刚重建，等 1 分钟后重跑验收）' % ','.join(bad))
+    sys.exit(1)
 PY
 
 echo "== 开机钩子 =="

@@ -1,439 +1,515 @@
-﻿<#
+﻿#requires -Version 5.1
+<#
 .SYNOPSIS
-    小米智能存储（RP05）一键部署：root → SSH 固化 → 插件安装 → 稳定性栈。
+    小米智能存储（RP05）一键部署工具 —— 双击即用版。
 
 .DESCRIPTION
-    分阶段执行，每阶段可单独跑，失败即停且不掩盖错误：
+    给小白：直接双击「一键部署.cmd」，全程跟着提示走即可。
+    脚本会自动完成：找证书 → 找 NAS → 生成密钥 → 下载组件 →
+    root → 固化 SSH → 装插件 → 装保护组件 → 自动验收。
 
-      check     环境自检（Python / 证书 / 上游代码 / 配置 / 设备可达）
-      probe     只读预检 + 写预演（不建账号、不写 /etc）
-      root      执行 root，拿到临时 root shell（重启后消失）
-      ssh       固化 SSH（修补 dropbear、开机自启、开机钩子）
-      plugins   安装插件（dockerctl / sysmon / pcbackup）
-      stack     部署稳定性栈（目录守卫 + 自愈 + 运行期迁移）
-      verify    验收（含一次真实对账）
-      all       以上全跑（默认）
+    中断后再跑：已完成的步骤会自动跳过（进度存在 config\.state.json）。
+    想从头再来：加 -Force。
 
-.PARAMETER Stage
-    要执行的阶段，默认 all。
-
-.PARAMETER ConfigPath
-    配置文件路径，默认 config/config.json。
-
-.PARAMETER Yes
-    跳过所有交互确认（无人值守用）。
-
-.PARAMETER RootPassword
-    设置 root 密码以启用密码登录兜底；不传则交互询问，回答空表示仅用密钥。
+    给进阶用户（详见 docs/04-运维手册.md）：
+      -Stage check      只做环境自检
+      -Stage verify     固件升级后复检
+      -Stage uninstall  卸载全部组件
+      -Stage root / ssh / plugins / stack / probe   单独跑某一步
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File windows\deploy.ps1
-
-.EXAMPLE
-    powershell -ExecutionPolicy Bypass -File windows\deploy.ps1 -Stage verify
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('all', 'check', 'probe', 'root', 'ssh', 'plugins', 'stack', 'verify', 'uninstall')]
-    [string]$Stage = 'all',
-    [string]$ConfigPath,
-    [switch]$Yes,
-    [string]$RootPassword
+    [ValidateSet('auto', 'check', 'probe', 'root', 'ssh', 'plugins', 'stack', 'verify', 'uninstall')]
+    [string]$Stage = 'auto',
+    [switch]$Force,      # 忽略进度标记，全部重跑
+    [switch]$Yes,        # 跳过确认提问（无人值守）
+    [string]$RootPassword  # 预设 root 密码；不传则在 SSH 阶段询问（可留空）
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Root = Split-Path -Parent $PSScriptRoot
-$script:Core = Join-Path $script:Root 'core'
-$script:Vendor = Join-Path $script:Root 'vendor\upstream'
-if (-not $ConfigPath) { $ConfigPath = Join-Path $script:Root 'config\config.json' }
-$script:ConfigPath = $ConfigPath
-$script:Cfg = $null
-$script:Python = 'python'
-$script:StageDir = '/data/minas/plugins/catalog/stage'
+$ProgressPreference = 'SilentlyContinue'   # 关掉下载/解压的进度条刷屏
 
-# ---------- 输出 ----------
-function Step($text) { Write-Host ""; Write-Host "==== $text ====" -ForegroundColor Cyan }
-function Ok($text) { Write-Host "  [OK]   $text" -ForegroundColor Green }
-function Info($text) { Write-Host "  [--]   $text" -ForegroundColor Gray }
-function Warn($text) { Write-Host "  [WARN] $text" -ForegroundColor Yellow }
-function Fail($text) { Write-Host "  [FAIL] $text" -ForegroundColor Red }
+# ============================================================
+# 路径常量（脚本位置无关，全部相对仓库根目录推导）
+# ============================================================
+$script:Root      = Split-Path -Parent $PSScriptRoot          # 仓库根目录
+$script:Core      = Join-Path $script:Root 'core'             # 核心脚本（Python/Shell）
+$script:Vendor    = Join-Path $script:Root 'vendor\upstream'  # 上游代码（自动下载）
+$script:ConfigDir = Join-Path $script:Root 'config'
+$script:ConfigPath = Join-Path $script:ConfigDir 'config.json'  # 你的配置（自动生成，不入库）
+$script:StatePath  = Join-Path $script:ConfigDir '.state.json'  # 进度标记（断点续跑用）
+$script:StageDir   = '/data/minas/plugins/catalog/stage'        # NAS 上的部署暂存目录
+$script:Python     = $null   # 由「找-Python」解析，不用裸 python（避开商店占位 stub）
 
-function Stop-Here($message, $hint) {
-    Write-Host ""
-    Write-Host "中止：$message" -ForegroundColor Red
-    if ($hint) { Write-Host "恢复建议：$hint" -ForegroundColor Yellow }
+# ============================================================
+# 找一个真正能用的 Python：
+#   依次尝试 python → py 启动器 → 常见安装目录（含 WorkBuddy 自带）。
+#   注意：Windows 自带的 python.exe 可能是「打开应用商店」的占位 stub，
+#   所以必须真的跑一下 -c 验证输出，而不是只看命令存在。
+# ============================================================
+function 找-Python {
+    $候选 = @('python')
+    $py = Get-Command py -ErrorAction SilentlyContinue
+    if ($py) { $候选 += 'py' }
+    foreach ($模式 in @("$env:LOCALAPPDATA\Programs\Python\Python3*\python.exe",
+                        "$env:USERPROFILE\.workbuddy\binaries\python\versions\*\python.exe",
+                        'C:\Python3*\python.exe')) {
+        $命中 = Get-Item $模式 -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
+        if ($命中) { $候选 += $命中.FullName }
+    }
+    foreach ($c in $候选) {
+        try {
+            $ver = & $c -c "import sys;print('%d.%d' % sys.version_info[:2])" 2>$null
+            if ($LASTEXITCODE -eq 0 -and $ver -match '^\d+\.\d+$') {
+                return @{ 路径 = $c; 版本 = $ver.Trim() }
+            }
+        } catch { }
+    }
+    return $null
+}
+
+# ============================================================
+# 日志输出：四种级别，统一格式
+#   ✓ 成功（绿）  → 进行中（灰）  ! 警告（黄）  ✗ 失败（红）
+# ============================================================
+function 说-步骤($文本) { Write-Host ''; Write-Host "【$文本】" -ForegroundColor Cyan }
+function 说-成功($文本) { Write-Host "  ✓ $文本" -ForegroundColor Green }
+function 说-信息($文本) { Write-Host "  → $文本" -ForegroundColor Gray }
+function 说-警告($文本) { Write-Host "  ! $文本" -ForegroundColor Yellow }
+function 说-失败($文本) { Write-Host "  ✗ $文本" -ForegroundColor Red }
+
+# 失败即停：打印「现象 +  numbered 排查建议」，不让小白面对堆栈
+function 停在这里($现象, [string[]]$建议) {
+    Write-Host ''
+    说-失败 $现象
+    if ($建议) {
+        Write-Host '  你可以这样排查：' -ForegroundColor Yellow
+        for ($i = 0; $i -lt $建议.Count; $i++) {
+            Write-Host ("    {0}. {1}" -f ($i + 1), $建议[$i]) -ForegroundColor Yellow
+        }
+    }
+    Write-Host '  修好后重新双击「一键部署.cmd」即可，已完成的步骤会自动跳过。' -ForegroundColor DarkGray
     exit 1
 }
 
-function Confirm-Action($message, $defaultYes = $false) {
-    if ($Yes) { return $true }
-    $suffix = if ($defaultYes) { '[Y/n]' } else { '[y/N]' }
-    $answer = Read-Host "$message $suffix"
-    if ([string]::IsNullOrWhiteSpace($answer)) { return $defaultYes }
-    return $answer -match '^(y|yes|是)$'
+function 询问($问题, $默认 = '') {
+    if ($默认) { $提示 = "$问题（回车=$默认）" } else { $提示 = $问题 }
+    $答 = Read-Host "  $提示"
+    if ([string]::IsNullOrWhiteSpace($答)) { return $默认 }
+    return $答.Trim()
 }
 
-# ---------- 配置 ----------
-function Get-Cfg {
-    if ($script:Cfg) { return $script:Cfg }
+# ============================================================
+# 进度标记：每完成一步写进 config\.state.json，重跑时自动跳过
+# ============================================================
+function 读-进度 {
+    if (Test-Path $script:StatePath) {
+        try { return @((Get-Content $script:StatePath -Raw -Encoding UTF8 | ConvertFrom-Json)) }
+        catch { return @() }
+    }
+    return @()
+}
+function Test-完成($步骤) {
+    if ($Force) { return $false }
+    return (读-进度) -contains $步骤
+}
+function 标记-完成($步骤) {
+    $进度 = @(读-进度)
+    if ($进度 -notcontains $步骤) {
+        $进度 += $步骤
+        if (-not (Test-Path $script:ConfigDir)) { New-Item -ItemType Directory -Force -Path $script:ConfigDir | Out-Null }
+        [System.IO.File]::WriteAllText($script:StatePath,
+            ($进度 | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
+    }
+}
+
+# ============================================================
+# 配置读写
+# ============================================================
+function 读-配置 {
     if (-not (Test-Path $script:ConfigPath)) { return $null }
-    $script:Cfg = Get-Content $script:ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    return $script:Cfg
+    return Get-Content $script:ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
 }
-
-function Save-Cfg {
-    $json = $script:Cfg | ConvertTo-Json -Depth 8
-    $dir = Split-Path -Parent $script:ConfigPath
-    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+function 写-配置($配置) {
+    if (-not (Test-Path $script:ConfigDir)) { New-Item -ItemType Directory -Force -Path $script:ConfigDir | Out-Null }
+    $json = $配置 | ConvertTo-Json -Depth 8
     [System.IO.File]::WriteAllText($script:ConfigPath, $json, (New-Object System.Text.UTF8Encoding($false)))
-    Ok "配置已写入 $script:ConfigPath"
 }
 
-function Initialize-Config {
-    if (Test-Path $script:ConfigPath) { return }
-    Step '首次运行：生成配置'
-    $example = Join-Path $script:Root 'config\config.example.json'
-    if (-not (Test-Path $example)) { Stop-Here "缺少配置模板 $example" $null }
-    $script:Cfg = Get-Content $example -Raw -Encoding UTF8 | ConvertFrom-Json
-
-    $ip = Read-Host '请输入 NAS 的局域网 IP（路由器后台可见）'
-    if ([string]::IsNullOrWhiteSpace($ip)) { Stop-Here '未输入 IP' $null }
-    $script:Cfg.device.host = $ip.Trim()
-
-    $key = Read-Host 'SSH 私钥路径（回车使用默认 ~/.ssh/id_ed25519_minas）'
-    if ([string]::IsNullOrWhiteSpace($key)) {
-        $script:Cfg.access.key_path = Join-Path $env:USERPROFILE '.ssh\id_ed25519_minas'
-    } else {
-        $script:Cfg.access.key_path = $key.Trim()
+# ============================================================
+# 子进程封装：统一错误处理
+# ============================================================
+function 跑-Python {
+    param([string[]]$参数, [switch]$允许失败, [switch]$静默)
+    $输出 = & $script:Python -X utf8 @参数 2>&1
+    $码 = $LASTEXITCODE
+    if (-not $静默) { $输出 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray } }
+    if ($码 -ne 0 -and -not $允许失败) {
+        停在这里 "Python 脚本执行失败（退出码 $码）" @('看上面最后一行输出定位原因', '重新双击一键部署重试')
     }
-
-    $cert = Read-Host '证书目录（回车使用默认 %LOCALAPPDATA%\minasCert）'
-    if ([string]::IsNullOrWhiteSpace($cert)) {
-        $script:Cfg.access.cert_dir = Join-Path $env:LOCALAPPDATA 'minasCert'
-    } else {
-        $script:Cfg.access.cert_dir = $cert.Trim()
-    }
-
-    $subnet = ($script:Cfg.device.host -replace '\.\d+$', '.0/24')
-    $script:Cfg.access.allowed_ips = @($subnet)
-    Save-Cfg
-    Info "2323 来源白名单初始为同网段 $subnet（可在配置里收紧为单机 IP）"
+    return $输出
 }
 
-function Assert-Cfg {
-    $cfg = Get-Cfg
-    if (-not $cfg) { Stop-Here '配置不存在' '先运行 windows\bootstrap.ps1 或首次向导' }
-    if ([string]::IsNullOrWhiteSpace($cfg.device.host)) { Stop-Here '配置缺少 device.host' $null }
-    if (-not $cfg.access.key_path) {
-        $cfg.access.key_path = Join-Path $env:USERPROFILE '.ssh\id_ed25519_minas'
-    }
-    return $cfg
-}
-
-function Resolve-Identity {
-    $cfg = Assert-Cfg
-    if ($cfg.device.uid -and $cfg.device.sn) { return }
-    Info '解析设备身份（SN / UID），只读证书会话'
-    $out = Invoke-Py @((Join-Path $script:Core 'nowsl_run.py'), 'info') -AllowFail -Quiet
-    $text = ($out | Out-String)
-    $uidMatch = [regex]::Match($text, 'UID=(\S+)')
-    $snMatch = [regex]::Match($text, 'SN=(\S+)')
-    if ($uidMatch.Success -and -not $cfg.device.uid) { $cfg.device.uid = $uidMatch.Groups[1].Value }
-    if ($snMatch.Success -and -not $cfg.device.sn) { $cfg.device.sn = $snMatch.Groups[1].Value }
-    if ($cfg.device.uid) {
-        Save-Cfg
-        Ok "UID=$($cfg.device.uid)   SN=$($cfg.device.sn)"
-    } else {
-        Warn '未能自动解析 UID，请手工填写配置里的 device.uid'
-    }
-}
-
-# ---------- 基础动作 ----------
-function Invoke-Py {
-    param([string[]]$PyArgs, [switch]$AllowFail, [switch]$Quiet)
-    $output = & $script:Python -X utf8 @PyArgs 2>&1
-    $code = $LASTEXITCODE
-    if (-not $Quiet) { $output | ForEach-Object { Write-Host $_ } }
-    if ($code -ne 0 -and -not $AllowFail) {
-        Stop-Here "python 退出码 $code" '看上面的输出定位；可加 -Stage check 复检环境'
-    }
-    return $output
-}
-
-function Invoke-Remote {
-    param([string]$RemoteCommand, [switch]$AllowFail, [switch]$Quiet)
-    $cfg = Assert-Cfg
+function 跑-SSH {
+    param([string]$命令, [switch]$允许失败, [switch]$静默)
+    $cfg = 读-配置
     $sshArgs = @(
         '-i', $cfg.access.key_path,
         '-o', 'BatchMode=yes',
         '-o', 'StrictHostKeyChecking=accept-new',
         '-o', 'ConnectTimeout=10',
-        '-p', "$($cfg.access.ssh_port)",
         "$($cfg.access.ssh_user)@$($cfg.device.host)",
-        $RemoteCommand
+        $命令
     )
-    $output = & ssh @sshArgs 2>&1
-    $code = $LASTEXITCODE
-    if (-not $Quiet) { $output | ForEach-Object { Write-Host $_ } }
-    if ($code -ne 0 -and -not $AllowFail) {
-        Stop-Here "远程命令失败（退出码 $code）" '确认 SSH 可用：ssh -i <私钥> root@<IP> "id -u"'
+    $输出 = & ssh @sshArgs 2>&1
+    $码 = $LASTEXITCODE
+    if (-not $静默) { $输出 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray } }
+    if ($码 -ne 0 -and -not $允许失败) {
+        停在这里 "NAS 上的命令执行失败（退出码 $码）" @('确认能登录：ssh nas', '重新双击一键部署重试')
     }
-    return @{ Code = $code; Output = $output }
+    return @{ 码 = $码; 输出 = $输出 }
 }
 
-function Test-Tcp($targetHost, $targetPort, $timeoutMs = 2500) {
-    $client = New-Object System.Net.Sockets.TcpClient
+function 传-文件($本地, $远端) {
+    $cfg = 读-配置
+    $目录 = ($远端 -replace '/[^/]+$', '')
+    跑-SSH "mkdir -p '$目录'" -静默 | Out-Null
+    $scpArgs = @('-i', $cfg.access.key_path, '-o', 'StrictHostKeyChecking=accept-new',
+                 $本地, "$($cfg.access.ssh_user)@$($cfg.device.host):$远端")
+    $out = & scp @scpArgs 2>&1
+    if ($LASTEXITCODE -ne 0) { 停在这里 "上传文件失败：$本地" @($out -join ' ') }
+}
+
+function 测-端口($主机名, $端口, $毫秒 = 1500) {
+    $c = New-Object System.Net.Sockets.TcpClient
     try {
-        $task = $client.ConnectAsync($targetHost, $targetPort)
-        if ($task.Wait($timeoutMs) -and $client.Connected) { return $true }
-        return $false
-    } catch {
-        return $false
-    } finally {
-        $client.Close()
-    }
+        $t = $c.ConnectAsync($主机名, $端口)
+        return ($t.Wait($毫秒) -and $c.Connected)
+    } catch { return $false } finally { $c.Close() }
 }
 
-function Wait-Tcp($targetHost, $targetPort, $seconds, $label) {
-    $deadline = (Get-Date).AddSeconds($seconds)
-    while ((Get-Date) -lt $deadline) {
-        if (Test-Tcp $targetHost $targetPort 1500) { return $true }
+function 等-端口($主机名, $端口, $秒, $名字) {
+    $截止 = (Get-Date).AddSeconds($秒)
+    while ((Get-Date) -lt $截止) {
+        if (测-端口 $主机名 $端口 1500) { return $true }
         Start-Sleep -Seconds 3
     }
-    Warn "$label 在 $seconds 秒内未就绪"
     return $false
 }
 
-function Send-File($localPath, $remotePath) {
-    $cfg = Assert-Cfg
-    $dir = ($remotePath -replace '/[^/]+$', '')
-    Invoke-Remote "mkdir -p '$dir'" -Quiet | Out-Null
-    $scpArgs = @(
-        '-i', $cfg.access.key_path,
-        '-o', 'StrictHostKeyChecking=accept-new',
-        '-P', "$($cfg.access.ssh_port)",
-        $localPath,
-        "$($cfg.access.ssh_user)@$($cfg.device.host):$remotePath"
-    )
-    $out = & scp @scpArgs 2>&1
-    if ($LASTEXITCODE -ne 0) { Stop-Here "上传 $localPath 失败" ($out -join ' ') }
+# SSH 免密是否已可用（用于判断"这台机器是不是已经部署过了"）
+function 测-SSH可用 {
+    $cfg = 读-配置
+    if (-not $cfg) { return $false }
+    if (-not (Test-Path $cfg.access.key_path)) { return $false }
+    $r = 跑-SSH 'id -u' -允许失败 -静默
+    return ($r.码 -eq 0 -and ($r.输出 -join '') -match '^\s*0')
 }
 
-# ---------- 阶段：check ----------
-function Invoke-Check {
-    Step '阶段 1/7 环境自检'
-    $cfg = Assert-Cfg
-    Info "设备：$($cfg.device.host)    UID：$(if ($cfg.device.uid) { $cfg.device.uid } else { '(待解析)' })"
+# ============================================================
+# 第 1 步：环境自检（Python / 证书 / 密钥 / 上游代码）
+# ============================================================
+function 步骤-环境自检 {
+    说-步骤 '第 1 步 / 共 6 步：检查你的电脑环境'
 
-    $py = & $script:Python -c "import sys;print('%d.%d' % sys.version_info[:2])" 2>&1
-    if ($LASTEXITCODE -ne 0) { Stop-Here 'python 不可用' '安装 Python 3.10+ 并勾选 Add to PATH' }
-    $major, $minor = $py.Split('.')
+    # Python 是全部工具的载体，没有就直接给安装指引
+    $py = 找-Python
+    if (-not $py) {
+        停在这里 '没有找到 Python' @(
+            '打开 https://www.python.org/downloads/ 下载安装',
+            '安装时务必勾选「Add python.exe to PATH」',
+            '装完后重新双击一键部署')
+    }
+    $script:Python = $py.路径
+    $major, $minor = $py.版本.Split('.')
     if ([int]$major -lt 3 -or ([int]$major -eq 3 -and [int]$minor -lt 10)) {
-        Stop-Here "Python 版本过低（$py）" '本工具需要 Python 3.10 或更新'
+        停在这里 "Python 版本太低（$($py.版本)）" @('需要 3.10 或更新版本，去 python.org 下载最新版')
     }
-    Ok "Python $py"
+    说-成功 "Python $($py.版本)"
 
+    # keystone-engine：root 工具内置机器码，正常用不到；装不上只警告
     & $script:Python -c "import keystone" 2>$null
-    if ($LASTEXITCODE -ne 0) { Warn 'keystone-engine 未安装，root 阶段会失败（bootstrap.ps1 会自动装）' }
-    else { Ok 'keystone-engine 可用' }
-
-    $deployTool = Join-Path $script:Vendor 'deploy-plugins.py'
-    if (-not (Test-Path $deployTool)) { Stop-Here '上游代码缺失' '先运行 windows\bootstrap.ps1' }
-    Ok '上游代码就绪'
-
-    $certDir = $cfg.access.cert_dir
-    $certs = @()
-    if ($certDir -and (Test-Path $certDir)) { $certs = @(Get-ChildItem $certDir -Filter '*_cert.pem') }
-    if ($certs.Count -eq 0) {
-        Stop-Here "证书目录里没有 *_cert.pem（$certDir）" '先安装「小米智能存储」桌面端并登录目标设备'
+    if ($LASTEXITCODE -ne 0) {
+        说-信息 '安装可选组件 keystone-engine'
+        & $script:Python -m pip install keystone-engine --quiet --disable-pip-version-check 2>$null
     }
-    Ok "客户端证书：$($certs[0].Name)"
+    说-成功 '组件依赖就绪'
 
-    if (Test-Tcp $cfg.device.host 443) { Ok '设备 443 可达' }
-    else { Stop-Here "连不上 $($cfg.device.host):443" '确认 NAS 已开机、IP 未变（路由器后台查看）' }
+    # 证书：小米存储 App 登录后自动留在 %LOCALAPPDATA%\minasCert
+    $证书目录 = Join-Path $env:LOCALAPPDATA 'minasCert'
+    $证书 = @()
+    if (Test-Path $证书目录) { $证书 = @(Get-ChildItem $证书目录 -Filter '*_cert.pem') }
+    if ($证书.Count -eq 0) {
+        停在这里 '没有找到小米存储的登录证书' @(
+            '先在电脑上安装「小米智能存储」客户端（mi.com 官网下载）',
+            '打开客户端并登录你的米家账号，确认能看到你的 NAS',
+            '然后重新双击一键部署')
+    }
+    说-成功 "找到登录证书（$($证书[0].Name)）"
 
-    $key = $cfg.access.key_path
-    $keyOk = (Test-Path $key) -and (Test-Path "$key.pub")
-    if ($keyOk) { Ok "SSH 私钥：$key" } else { Warn "私钥不存在（$key），root 阶段会自动生成" }
+    # SSH 密钥：没有就自动生成一对（免密登录用）
+    $密钥 = Join-Path $env:USERPROFILE '.ssh\id_ed25519_minas'
+    if (-not (Test-Path $密钥)) {
+        说-信息 '生成 SSH 密钥（相当于给你配一把专用钥匙）'
+        & ssh-keygen -t ed25519 -f $密钥 -N '""' -q 2>$null
+        if (-not (Test-Path $密钥)) { 停在这里 '密钥生成失败' @('以管理员身份打开 PowerShell 再试') }
+    }
+    说-成功 "SSH 密钥就绪"
 
-    Resolve-Identity
+    # 上游代码：公开仓库不内嵌第三方代码，按需下载（优先 git，无 git 用 zip）
+    if (-not (Test-Path (Join-Path $script:Vendor 'deploy-plugins.py'))) {
+        说-信息 '下载所需组件（首次运行需要，约 1-2 分钟）'
+        下载-上游代码
+    }
+    说-成功 '组件代码就绪'
+
+    标记-完成 'env'
 }
 
-# ---------- 阶段：probe ----------
-function Invoke-Probe {
-    Step '阶段 2/7 只读预检'
-    Info '这一步只用证书查询设备状态，不创建账号、不写 /etc'
-    Invoke-Py @((Join-Path $script:Core 'nowsl_run.py'), 'probe') -AllowFail | Out-Null
+# 下载上游代码：有 git 用 git clone，没有就下载 zip 包解压
+function 下载-上游代码 {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $仓库 = 'https://github.com/lvmaple/minas_plugin.git'
+    $父目录 = Split-Path -Parent $script:Vendor
+    if (-not (Test-Path $父目录)) { New-Item -ItemType Directory -Force -Path $父目录 | Out-Null }
 
-    Step '阶段 2b/7 写预演（MKCOL 控制字符目录名）'
-    Info '建一个一次性目录再立刻删掉，确认注入链第一环还在'
-    $out = Invoke-Py @((Join-Path $script:Core 'write_probe.py')) -AllowFail
-    $text = ($out | Out-String)
-    if ($text -match '^GO:' -or $text -match 'GO: MKCOL') {
-        Ok '写预演通过：控制字符目录名仍被接受'
-    } elseif ($text -match 'NO-GO') {
-        Stop-Here '写预演未通过，当前固件可能已修补注入链' '如果设备已被 root 过，可跳过本阶段：-Stage root'
+    $git = Get-Command git -ErrorAction SilentlyContinue
+    if ($git) {
+        if (Test-Path $script:Vendor) { Remove-Item $script:Vendor -Recurse -Force }
+        & git clone --depth 1 $仓库 $script:Vendor 2>&1 | Out-Null
+        if (Test-Path (Join-Path $script:Vendor 'deploy-plugins.py')) { return }
+    }
+    # zip 兜底（无需安装 git）
+    $zip = Join-Path $env:TEMP 'minas_plugin.zip'
+    try {
+        Invoke-WebRequest -Uri 'https://codeload.github.com/lvmaple/minas_plugin/zip/refs/heads/main' -OutFile $zip -UseBasicParsing
+        if (Test-Path $script:Vendor) { Remove-Item $script:Vendor -Recurse -Force }
+        Expand-Archive $zip -DestinationPath $父目录 -Force
+        Rename-Item (Join-Path $父目录 'minas_plugin-main') $script:Vendor
+    } catch {
+        停在这里 '组件下载失败' @('检查网络能否访问 github.com', '或手动下载后解压到 vendor\upstream 目录')
+    } finally {
+        Remove-Item $zip -Force -ErrorAction SilentlyContinue
+    }
+    if (-not (Test-Path (Join-Path $script:Vendor 'deploy-plugins.py'))) {
+        停在这里 '组件不完整' @('删除 vendor 目录后重新运行')
     }
 }
 
-# ---------- 阶段：root ----------
-function Invoke-Root {
-    Step '阶段 3/7 执行 root（获取临时 root shell）'
-    $cfg = Assert-Cfg
-    Warn '将利用固件漏洞获取 root；仅限你本人拥有的设备'
-    if (-not (Confirm-Action '确认继续？')) { Stop-Here '用户取消' $null }
+# ============================================================
+# 第 2 步：找到你的 NAS（自动扫描 → 找不到才问）
+# ============================================================
+function 步骤-寻找设备 {
+    说-步骤 '第 2 步 / 共 6 步：寻找你的 NAS'
 
-    $pyArgs = @(
-        (Join-Path $script:Core 'nowsl_run.py'), 'root',
-        $cfg.device.host,
-        '--cert-dir', $cfg.access.cert_dir,
-        '--shell-port', "$($cfg.device.shell_port)"
-    )
-    if ($cfg.device.uid) { $pyArgs += @('--uid', "$($cfg.device.uid)") }
-    Invoke-Py $pyArgs
-
-    Info '等待 2323 root shell 就绪（最多 90 秒）'
-    if (-not (Wait-Tcp $cfg.device.host ([int]$cfg.device.shell_port) 90 'root shell')) {
-        Stop-Here 'root shell 未起来' '若日志显示触发成功但缺 socat，可改走 SSH 认证通道直接跑 -Stage ssh'
+    $cfg = 读-配置
+    if ($cfg -and $cfg.device.host) {
+        if (测-端口 $cfg.device.host 443) {
+            说-成功 "NAS 在线：$($cfg.device.host)"
+            标记-完成 'device'; return
+        }
+        说-警告 "配置里的 $($cfg.device.host) 连不上了，重新扫描"
     }
-    Ok "root shell 就绪：$($cfg.device.host):$($cfg.device.shell_port)"
+
+    说-信息 '正在自动扫描局域网（约几秒钟）'
+    $证书目录 = Join-Path $env:LOCALAPPDATA 'minasCert'
+    $结果 = 跑-Python @((Join-Path $script:Core 'find_nas.py'), '--cert-dir', $证书目录) -允许失败 -静默
+    $找到 = $null
+    try {
+        $解析 = ($结果 | Out-String).Trim() | ConvertFrom-Json
+        if ($解析.ok) { $找到 = $解析 }
+    } catch { }
+
+    if ($找到) {
+        说-成功 "找到了：$($找到.host)"
+        $ip = $找到.host
+    } else {
+        说-警告 '自动扫描没找到（可能是电脑和 NAS 不在同一网段）'
+        $ip = 询问 '请手动输入 NAS 的 IP（小米存储 App → 设备详情里能看到）'
+        if (-not $ip) { 停在这里 '没有输入 IP' @('确认 NAS 已开机', '电脑和 NAS 接在同一个路由器下') }
+    }
+
+    # 生成/更新配置（只此一份，所有脚本共享）
+    if (-not $cfg) { $cfg = Get-Content (Join-Path $script:ConfigDir 'config.example.json') -Raw -Encoding UTF8 | ConvertFrom-Json }
+    $cfg.device.host = $ip
+    if ($找到) {
+        # 扫描结果里已带出 UID 和 SNI，省得后面再解析一次
+        if ($找到.uid) { $cfg.device.uid = "$($找到.uid)" }
+        if ($找到.sni) { $cfg.device.sn  = "$($找到.sni)" }
+    }
+    $cfg.access.cert_dir = $证书目录
+    $cfg.access.key_path = Join-Path $env:USERPROFILE '.ssh\id_ed25519_minas'
+    $cfg.access.allowed_ips = @(($ip -replace '\.\d+$', '.0/24'))
+    写-配置 $cfg
+    说-成功 '配置已保存（下次运行不用再找）'
+    标记-完成 'device'
 }
 
-# ---------- 阶段：ssh ----------
-function Invoke-SshPersist {
-    Step '阶段 4/7 固化 SSH'
-    $cfg = Assert-Cfg
+# ============================================================
+# 第 3 步：root（已部署过会自动跳过）
+# ============================================================
+function 步骤-获取root {
+    说-步骤 '第 3 步 / 共 6 步：获取设备控制权（root）'
 
+    if (测-SSH可用) {
+        说-成功 '检测到这台 NAS 已经部署过了，跳过 root'
+        标记-完成 'root'; 标记-完成 'ssh'; return
+    }
+
+    # 先解析设备身份（UID/SN），后面装插件要用
+    说-信息 '读取设备身份信息'
+    $身份 = 跑-Python @((Join-Path $script:Core 'nowsl_run.py'), 'info') -允许失败 -静默
+    $文本 = ($身份 | Out-String)
+    $cfg = 读-配置
+    if ($文本 -match 'UID=(\S+)') { $cfg.device.uid = $Matches[1] }
+    if ($文本 -match 'SN=(\S+)')  { $cfg.device.sn  = $Matches[1] }
+    if ($cfg.device.uid) { 写-配置 $cfg; 说-成功 "设备身份确认（UID=$($cfg.device.uid)）" }
+
+    # 写预演：确认注入链在这台设备上仍然有效，不通过就停手
+    说-信息 '安全检查：验证注入通道（约 10 秒，不会对设备做任何修改）'
+    $预演 = 跑-Python @((Join-Path $script:Core 'write_probe.py')) -允许失败 -静默
+    if (($预演 | Out-String) -match 'NO-GO') {
+        停在这里 '安全检查未通过：当前固件可能已修复注入漏洞' @(
+            '把这一屏的信息截图发给项目 Issues',
+            '不要继续操作，设备没有被修改，是安全的')
+    }
+    说-成功 '安全检查通过'
+
+    # 正式 root
+    Write-Host ''
+    Write-Host '  接下来将获取 NAS 的 root 权限（约 2 分钟）。' -ForegroundColor Yellow
+    Write-Host '  这利用了固件漏洞，仅限你本人拥有的设备。' -ForegroundColor DarkGray
+    if (-not $Yes) {
+        $答 = 询问 '确认继续？(y/n)' 'y'
+        if ($答 -notmatch '^(y|yes|是)$') { 停在这里 '已取消' @('设备未被修改') }
+    }
+    $cfg = 读-配置
+    $参数 = @((Join-Path $script:Core 'nowsl_run.py'), 'root', $cfg.device.host,
+              '--cert-dir', $cfg.access.cert_dir, '--shell-port', "$($cfg.device.shell_port)")
+    if ($cfg.device.uid) { $参数 += @('--uid', "$($cfg.device.uid)") }
+    跑-Python $参数
+
+    if (-not (等-端口 $cfg.device.host ([int]$cfg.device.shell_port) 90 'root 通道')) {
+        停在这里 'root 通道没有建立起来' @('重新双击一键部署重试', '若反复失败，把输出截图发到项目 Issues')
+    }
+    说-成功 'root 权限获取成功'
+    标记-完成 'root'
+}
+
+# ============================================================
+# 第 4 步：固化 SSH（重启不掉）+ 可选密码兜底
+# ============================================================
+function 步骤-固化SSH {
+    说-步骤 '第 4 步 / 共 6 步：让 SSH 重启后也能用'
+    if ((Test-完成 'ssh') -and (测-SSH可用)) { 说-成功 '已完成，跳过'; return }
+
+    $cfg = 读-配置
     if (-not $RootPassword -and -not $Yes) {
         Write-Host ''
-        Write-Host '  SSH 默认只认密钥。要不要额外设一个 root 密码作为兜底？' -ForegroundColor Yellow
-        Write-Host '  （内网家用风险可控；留空表示仅密钥登录，安全最高）' -ForegroundColor DarkGray
-        $secure = Read-Host '  输入 root 密码（留空=不设）' -AsSecureString
+        Write-Host '  要不要给 root 设一个密码？（密钥之外的备用钥匙）' -ForegroundColor Yellow
+        Write-Host '  直接回车 = 不设，只用密钥（最安全，推荐）' -ForegroundColor DarkGray
+        $secure = Read-Host '  密码' -AsSecureString
         $plain = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
             [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
         if (-not [string]::IsNullOrWhiteSpace($plain)) { $RootPassword = $plain }
     }
 
-    # 2323 通道还活着就用它；否则说明已重启过，退回 SSH
-    $useShell = Test-Tcp $cfg.device.host ([int]$cfg.device.shell_port) 1500
-    $script = Join-Path $script:Core 'ssh_persist.sh'
-
-    if ($useShell) {
-        Info '通过 2323 root shell 执行'
+    $脚本 = Join-Path $script:Core 'ssh_persist.sh'
+    if (测-端口 $cfg.device.host ([int]$cfg.device.shell_port) 1500) {
+        # root 通道还活着，走它（刚 root 完的情形）
         $envArg = @()
         if ($RootPassword) { $envArg = @('--env', "MINAS_ROOT_PASSWORD=$RootPassword") }
-        Invoke-Py (@((Join-Path $script:Core 'nowsl_run.py'), 'exec', '--file', $script, '--timeout', '240') + $envArg)
+        跑-Python (@((Join-Path $script:Core 'nowsl_run.py'), 'exec', '--file', $脚本, '--timeout', '240') + $envArg)
     } else {
-        Warn '2323 不可用，改走已有 SSH（需已注入公钥）'
-        Send-File $script '/tmp/ssh_persist.sh'
-        if ($RootPassword) {
-            Invoke-Remote "MINAS_ROOT_PASSWORD='$RootPassword' sh /tmp/ssh_persist.sh"
-        } else {
-            Invoke-Remote 'sh /tmp/ssh_persist.sh'
-        }
+        # 已重启过，走已有 SSH（前提是公钥已注入）
+        传-文件 $脚本 '/tmp/ssh_persist.sh'
+        if ($RootPassword) { $null = 跑-SSH "MINAS_ROOT_PASSWORD='$RootPassword' sh /tmp/ssh_persist.sh" }
+        else { $null = 跑-SSH 'sh /tmp/ssh_persist.sh' }
     }
     $RootPassword = $null
 
-    Info '等待 22 端口就绪'
-    if (-not (Wait-Tcp $cfg.device.host ([int]$cfg.access.ssh_port) 45 'SSH 22')) {
-        Stop-Here 'SSH 未起来' '在重启后仍可用 2323 的情况下重跑 -Stage ssh'
-    }
-    $id = Invoke-Remote 'id -u; hostname' -Quiet
-    Ok "SSH 已就绪（$($id.Output -join ' / ')）"
+    if (-not (等-端口 $cfg.device.host 22 45 'SSH')) { 停在这里 'SSH 服务没有起来' @('重跑一键部署') }
+    $r = 跑-SSH 'id -u' -静默
+    说-成功 'SSH 已固化（重启后自动恢复）'
+    标记-完成 'ssh'
 }
 
-# ---------- 阶段：plugins ----------
-function Invoke-Plugins {
-    Step '阶段 5/7 安装插件'
-    $cfg = Assert-Cfg
+# ============================================================
+# 第 5 步：安装插件 + 保护组件
+# ============================================================
+function 步骤-安装插件 {
+    说-步骤 '第 5 步 / 共 6 步：安装插件（Docker 控制台 / 系统监控 / PC 备份）'
+    if (Test-完成 'plugins') { 说-成功 '已完成，跳过'; return }
+    $cfg = 读-配置
     $enabled = @($cfg.plugins.enabled)
-    if ($enabled.Count -eq 0) { Stop-Here '配置里 plugins.enabled 为空' $null }
-    Info "将安装：$($enabled -join ', ')"
-
-    $select = ($enabled -join ',')
-    Invoke-Py @((Join-Path $script:Core 'nowsl_run.py'), 'deploy', '--select', $select)
-    Ok '插件安装流程结束'
+    说-信息 "将安装：$($enabled -join '、')"
+    跑-Python @((Join-Path $script:Core 'nowsl_run.py'), 'deploy', '--select', ($enabled -join ','))
+    说-成功 '插件安装完成'
+    标记-完成 'plugins'
 }
 
-# ---------- 阶段：stack ----------
-function Build-Stage {
-    $cfg = Assert-Cfg
-    $stageLocal = Join-Path $script:Root 'stage'
-    if (Test-Path $stageLocal) { Remove-Item $stageLocal -Recurse -Force }
-    New-Item -ItemType Directory -Force -Path (Join-Path $stageLocal 'units') | Out-Null
+function 步骤-保护组件 {
+    说-步骤 '第 6 步 / 共 6 步：安装保护组件（防止重启后插件丢失）'
+    if (Test-完成 'stack') { 说-成功 '已完成，跳过'; return }
+    $cfg = 读-配置
+    if (-not $cfg.device.uid) {
+        停在这里 '缺少设备 UID' @('删除 config\config.json 后重新运行')
+    }
 
-    Copy-Item (Join-Path $script:Core 'catalog_guard.py') $stageLocal
-    Copy-Item (Join-Path $script:Core 'keep_plugins_v4.py') $stageLocal
-    Copy-Item (Join-Path $script:Core 'keepctl.sh') $stageLocal
-    Copy-Item (Join-Path $script:Core 'hook_v4.sh') $stageLocal
-    Copy-Item (Join-Path $script:Core 'deploy_v4.sh') $stageLocal
-    Copy-Item (Join-Path $script:Core 'validate_v4.sh') $stageLocal
-    Copy-Item (Join-Path $script:Core 'uninstall.sh') $stageLocal
-    Copy-Item (Join-Path $script:Core 'units\*') (Join-Path $stageLocal 'units')
-    # 运维手册随部署一起上机，登录后可直接 cat
-    Copy-Item (Join-Path $script:Root 'docs\04-运维手册.md') (Join-Path $stageLocal '使用说明.md')
+    # 组装部署包：脚本 + 配置（deploy.json 由此唯一生成）
+    $stage = Join-Path $script:Root 'stage'
+    if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path (Join-Path $stage 'units') | Out-Null
+    foreach ($f in 'catalog_guard.py', 'keep_plugins_v4.py', 'keepctl.sh', 'hook_v4.sh',
+                   'deploy_v4.sh', 'validate_v4.sh', 'uninstall.sh') {
+        Copy-Item (Join-Path $script:Core $f) $stage
+    }
+    Copy-Item (Join-Path $script:Core 'units\*') (Join-Path $stage 'units')
+    Copy-Item (Join-Path $script:Root 'docs\04-运维手册.md') (Join-Path $stage '使用说明.md')
 
     $ports = @{}
     foreach ($p in $cfg.plugins.enabled) { $ports[$p] = [int]$cfg.plugins.ports.$p }
     $deployJson = [ordered]@{
-        device  = [ordered]@{
-            uid        = "$($cfg.device.uid)"
-            sn         = "$($cfg.device.sn)"
-            shell_port = [int]$cfg.device.shell_port
-        }
-        access  = [ordered]@{
-            allowed_ips = @($cfg.access.allowed_ips)
-        }
-        plugins = [ordered]@{
-            enabled = @($cfg.plugins.enabled)
-            ports   = $ports
-        }
-        selfheal = [ordered]@{
-            mode     = "$($cfg.selfheal.mode)"
-            calendar = "$($cfg.selfheal.calendar)"
-            interval = "$($cfg.selfheal.interval)"
-        }
+        device     = [ordered]@{ uid = "$($cfg.device.uid)"; sn = "$($cfg.device.sn)"; shell_port = [int]$cfg.device.shell_port }
+        access     = [ordered]@{ allowed_ips = @($cfg.access.allowed_ips) }
+        plugins    = [ordered]@{ enabled = @($cfg.plugins.enabled); ports = $ports }
+        selfheal   = [ordered]@{ mode = "$($cfg.selfheal.mode)"; calendar = "$($cfg.selfheal.calendar)"; interval = "$($cfg.selfheal.interval)" }
         guard_port = 9310
     }
-    $json = $deployJson | ConvertTo-Json -Depth 8
-    $target = Join-Path $stageLocal 'deploy.json'
-    [System.IO.File]::WriteAllText($target, $json, (New-Object System.Text.UTF8Encoding($false)))
-    return $stageLocal
-}
+    [System.IO.File]::WriteAllText((Join-Path $stage 'deploy.json'),
+        ($deployJson | ConvertTo-Json -Depth 8), (New-Object System.Text.UTF8Encoding($false)))
 
-function Invoke-Stack {
-    Step '阶段 6/7 部署稳定性栈'
-    $cfg = Assert-Cfg
-    if (-not $cfg.device.uid) { Resolve-Identity }
-    if (-not $cfg.device.uid) {
-        Stop-Here '配置缺少 device.uid（自研插件的用户目录名依赖它）' '手工填入米家数字 UID 后重跑 -Stage stack'
-    }
+    说-信息 '上传组件到 NAS'
+    跑-SSH "rm -rf $script:StageDir && mkdir -p $script:StageDir/units" -静默 | Out-Null
+    Get-ChildItem $stage -File | ForEach-Object { 传-文件 $_.FullName "$script:StageDir/$($_.Name)" }
+    Get-ChildItem (Join-Path $stage 'units') -File | ForEach-Object { 传-文件 $_.FullName "$script:StageDir/units/$($_.Name)" }
 
-    $stageLocal = Build-Stage
-    Info '上传组件到 NAS'
-    Invoke-Remote "rm -rf $script:StageDir && mkdir -p $script:StageDir/units" -Quiet | Out-Null
-    Get-ChildItem $stageLocal -File | ForEach-Object { Send-File $_.FullName "$script:StageDir/$($_.Name)" }
-    Get-ChildItem (Join-Path $stageLocal 'units') -File | ForEach-Object { Send-File $_.FullName "$script:StageDir/units/$($_.Name)" }
-    Ok '组件已上传'
-
-    Info '执行部署脚本（含一次真实对账）'
+    说-信息 '在 NAS 上完成安装（含一次真实同步测试）'
     $sn = if ($cfg.device.sn) { $cfg.device.sn } else { 'unknown' }
-    Invoke-Remote "sh $script:StageDir/deploy_v4.sh '$sn' '$script:StageDir'"
+    $null = 跑-SSH "sh $script:StageDir/deploy_v4.sh '$sn' '$script:StageDir'"
 
-    Info '安装 keepctl 命令入口'
-    Invoke-Remote "ln -sf /data/minas-ssh/keep-plugins/keepctl.sh /data/minas-ssh/keep-plugins/keepctl" -AllowFail -Quiet | Out-Null
-    Send-File (Join-Path $script:Core 'keepctl-profile.sh') '/etc/profile.d/keepctl.sh'
-    Invoke-Remote "chmod 644 /etc/profile.d/keepctl.sh" -AllowFail -Quiet | Out-Null
-    Ok 'keepctl 已可用（登录后直接敲 keepctl status）'
+    # keepctl 管理命令入口
+    跑-SSH "ln -sf /data/minas-ssh/keep-plugins/keepctl.sh /data/minas-ssh/keep-plugins/keepctl" -允许失败 -静默 | Out-Null
+    传-文件 (Join-Path $script:Core 'keepctl-profile.sh') '/etc/profile.d/keepctl.sh'
+    跑-SSH 'chmod 644 /etc/profile.d/keepctl.sh' -允许失败 -静默 | Out-Null
+    说-成功 '保护组件已就位'
+    标记-完成 'stack'
 }
 
-# ---------- 阶段：verify ----------
-function Invoke-Verify {
-    Step '阶段 7/7 验收（含真实对账）'
-    Invoke-Remote "sh $script:StageDir/validate_v4.sh --reconcile"
+# ============================================================
+# 收尾：验收 + 配置 ssh nas 别名 + 成功横幅
+# ============================================================
+function 步骤-验收 {
+    说-步骤 '最终验收'
+    $null = 跑-SSH "sh $script:StageDir/validate_v4.sh --reconcile"
+    标记-完成 'verify'
+}
 
-    Step '写入 SSH 别名（可选，方便日常登录）'
-    $cfg = Assert-Cfg
+function 配置-别名 {
+    $cfg = 读-配置
     $confPath = Join-Path $env:USERPROFILE '.ssh\config'
     $keyForConf = $cfg.access.key_path -replace '\\', '/'
     $block = @"
@@ -444,60 +520,72 @@ Host nas minas
     ServerAliveInterval 30
     ServerAliveCountMax 3
 "@
-    if (Test-Path $confPath) {
-        $existing = Get-Content $confPath -Raw -Encoding UTF8
-        if ($existing -match '(?m)^Host\s+nas\b') {
-            Info '~/.ssh/config 里已有 nas 别名，跳过'
-        } else {
-            Add-Content -Path $confPath -Value "`r`n$block" -Encoding UTF8
-            Ok '已追加 nas 别名，之后可直接 ssh nas'
-        }
-    } else {
-        $dir = Split-Path -Parent $confPath
-        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-        [System.IO.File]::WriteAllText($confPath, $block, (New-Object System.Text.UTF8Encoding($false)))
-        Ok '已创建 ~/.ssh/config，之后可直接 ssh nas'
-    }
+    $existing = ''
+    if (Test-Path $confPath) { $existing = Get-Content $confPath -Raw -Encoding UTF8 }
+    if ($existing -match '(?m)^Host\s+nas\b') { return }
+    $dir = Split-Path -Parent $confPath
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    Add-Content -Path $confPath -Value "`r`n$block" -Encoding UTF8
+    说-成功 '已配置别名，以后打开终端敲 ssh nas 就能连'
 }
 
-# ---------- 阶段：uninstall ----------
-function Invoke-Uninstall {
-    Step '卸载'
-    Warn '将停止并移除 SSH、目录守卫、自愈定时器与插件单元'
-    if (-not (Confirm-Action '确认继续？')) { Stop-Here '用户取消' $null }
-    Send-File (Join-Path $script:Core 'uninstall.sh') '/tmp/uninstall.sh'
-    Invoke-Remote 'sh /tmp/uninstall.sh'
+function 成功横幅 {
+    Write-Host ''
+    Write-Host '  ================================================' -ForegroundColor Green
+    Write-Host '   🎉 全部完成！' -ForegroundColor Green
+    Write-Host '  ================================================' -ForegroundColor Green
+    Write-Host ''
+    Write-Host '  现在可以：' -ForegroundColor White
+    Write-Host '   1. 打开小米存储 App → 应用市场，插件已就绪' -ForegroundColor Gray
+    Write-Host '   2. 想进命令行：打开 PowerShell 敲  ssh nas' -ForegroundColor Gray
+    Write-Host '   3. 查看保护组件状态：登录后敲  keepctl status' -ForegroundColor Gray
+    Write-Host ''
+    Write-Host '  放心折腾：重启、关机再开都不会丢。' -ForegroundColor DarkGray
+    Write-Host '  升级固件前请先看 docs\05-风险与边界.md。' -ForegroundColor DarkGray
 }
 
-# ---------- 主流程 ----------
+# ============================================================
+# 卸载
+# ============================================================
+function 步骤-卸载 {
+    说-步骤 '卸载全部组件'
+    说-警告 '将停止并移除 SSH、目录守卫、自愈定时器与插件'
+    $答 = 询问 '确认卸载？(y/n)' 'n'
+    if ($答 -notmatch '^(y|yes|是)$') { 停在这里 '已取消' @() }
+    传-文件 (Join-Path $script:Core 'uninstall.sh') '/tmp/uninstall.sh'
+    $null = 跑-SSH 'sh /tmp/uninstall.sh'
+    Remove-Item $script:StatePath -Force -ErrorAction SilentlyContinue
+    说-成功 '卸载完成'
+}
+
+# ============================================================
+# 主流程
+# ============================================================
 Write-Host ''
-Write-Host '  小米智能存储（RP05）部署工具' -ForegroundColor White
-Write-Host '  仅限你本人拥有的设备；操作有风险，请先读完 README 的风险声明' -ForegroundColor DarkGray
-
-Initialize-Config
-if ($Stage -eq 'check') { Invoke-Check; exit 0 }
+Write-Host '  ┌──────────────────────────────────────┐' -ForegroundColor Cyan
+Write-Host '  │   小米智能存储（RP05）一键工具箱      │' -ForegroundColor Cyan
+Write-Host '  └──────────────────────────────────────┘' -ForegroundColor Cyan
+Write-Host '  仅限你本人拥有的设备 · 操作有风险 · 详见 README' -ForegroundColor DarkGray
+Write-Host ''
 
 switch ($Stage) {
-    'all' {
-        Invoke-Check
-        Invoke-Probe
-        Invoke-Root
-        Invoke-SshPersist
-        Invoke-Plugins
-        Invoke-Stack
-        Invoke-Verify
+    'auto' {
+        步骤-环境自检
+        步骤-寻找设备
+        步骤-获取root
+        步骤-固化SSH
+        步骤-安装插件
+        步骤-保护组件
+        步骤-验收
+        配置-别名
+        成功横幅
     }
-    'probe' { Invoke-Probe }
-    'root' { Invoke-Root }
-    'ssh' { Invoke-SshPersist }
-    'plugins' { Invoke-Plugins }
-    'stack' { Invoke-Stack }
-    'verify' { Invoke-Verify }
-    'uninstall' { Invoke-Uninstall }
+    'check'     { 步骤-环境自检; 步骤-寻找设备 }
+    'probe'     { $r = 跑-Python @((Join-Path $script:Core 'write_probe.py')) -允许失败; $r | Out-Null }
+    'root'      { 步骤-获取root }
+    'ssh'       { 步骤-固化SSH }
+    'plugins'   { 步骤-安装插件 }
+    'stack'     { 步骤-保护组件 }
+    'verify'    { 步骤-验收 }
+    'uninstall' { 步骤-卸载 }
 }
-
-Write-Host ''
-Write-Host '完成。' -ForegroundColor Green
-Write-Host '  日常登录：ssh nas    （或 ssh -i <私钥> root@<IP>）' -ForegroundColor Gray
-Write-Host '  查看自愈：keepctl status' -ForegroundColor Gray
-Write-Host '  使用说明：cat /data/minas-ssh/keep-plugins/使用说明.md' -ForegroundColor Gray

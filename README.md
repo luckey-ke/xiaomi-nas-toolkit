@@ -44,28 +44,30 @@
 
 ---
 
-## 快速开始
+## 快速开始（小白版）
 
-```powershell
-# 1. 拉取上游第三方代码（插件源码 + root 工具），安装 keystone-engine
-powershell -ExecutionPolicy Bypass -File windows\bootstrap.ps1
+一共三步，不用改任何配置文件：
 
-# 2. 双击或在终端执行，按提示输入 NAS 的 IP
-windows\一键部署.cmd
-```
+1. 确认电脑上装过「小米智能存储」客户端并**登录过**（脚本要用它留下的证书）
+2. **双击 `windows\一键部署.cmd`**
+3. 等着，看到 🎉 就完成了
 
-首次运行会生成 `config\config.json` 并引导你填 IP；接着依次跑完 7 个阶段。全程约 6~10 分钟，其中 root 的触发等待约 75 秒、几次重启验证各约 5 分钟。
+脚本会自动：检查环境 → 扫描局域网找到你的 NAS（找不到才会问你 IP）→
+生成密钥 → 下载组件 → root → 固化 SSH → 装插件 → 装保护组件 → 自动验收。
+全程约 6~10 分钟。中途失败了照着屏幕上的 numbered 建议做，修好重新双击即可——
+已完成的步骤会自动跳过，不会重复折腾。
 
 结束后：
 
 ```powershell
-ssh nas                      # 直接进 root shell（会自动写入 ~/.ssh/config）
-keepctl status               # 看自愈定时器状态
+ssh nas                      # 直接进 root shell（已自动配好别名）
 ```
+
+> 进阶：分阶段执行、改定时策略、卸载等，见下文和 [docs/04-运维手册.md](docs/04-运维手册.md)。
 
 ---
 
-## 分阶段执行
+## 分阶段执行（进阶）
 
 一次跑完容易在中间出错时看不出位置，所以每个阶段都能单独跑：
 
@@ -203,10 +205,10 @@ powershell -ExecutionPolicy Bypass -File windows\deploy.ps1 -Stage uninstall
 ## 目录结构
 
 ```
-config/config.example.json   配置模板（复制为 config.json，已被 .gitignore）
-windows/bootstrap.ps1        拉取上游代码 + 装依赖
-windows/deploy.ps1           主流程（分阶段）
+config/config.example.json   配置模板（一键脚本会自动生成 config.json，无需手改）
+windows/deploy.ps1           主流程（向导式一键 + 分阶段进阶用法）
 windows/一键部署.cmd          双击入口
+core/find_nas.py             局域网自动发现 NAS（证书指纹 + 443 扫描）
 core/nowsl_run.py            无 WSL 通道（socket 直连 2323，运行时打补丁）
 core/write_probe.py          写预演（MKCOL 控制字符目录名）
 core/ssh_persist.sh          SSH 固化

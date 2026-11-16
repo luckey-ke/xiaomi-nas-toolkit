@@ -1,5 +1,5 @@
 {
-  "_comment": "复制为 config/config.json 后填写。只有 device.host 是必填项，uid 留空会自动从设备证书里解析。",
+  "_comment": "自动生成，通常不用手改。device.host 为空时一键脚本会自动扫描局域网寻找 NAS。",
 
   "device": {
     "host": "",

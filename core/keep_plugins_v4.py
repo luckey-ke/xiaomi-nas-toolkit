@@ -349,6 +349,16 @@ def ensure_registrations(cfg, entries):
         if server_changed:
             atomic_write(SERVER_LIST, json.dumps(catalog, ensure_ascii=False, separators=(",", ":")))
             changed.append("serverlist")
+    else:
+        # server.list 缺失或不是合法 JSON：plugincenter 是「先截断、再下载写入」，
+        # 云端一旦抖动就会留下 0 字节空文件（2026-11-16 实测发生）。
+        # 目录内容有守卫兜底，直接让 plugincenter 重新拉取重建即可。
+        if DRY_RUN:
+            print("[keep] (dry-run) would rebuild server.list via plugincenter update")
+        else:
+            print("[keep] server.list 缺失/损坏，触发 plugincenter 重建")
+            sh("plugincenter -u %s -p all update >/dev/null 2>&1" % cfg.user, timeout=180)
+            changed.append("serverlist-rebuild")
 
     ports = load_json(PORTS_FILE, None)
     if isinstance(ports, dict):

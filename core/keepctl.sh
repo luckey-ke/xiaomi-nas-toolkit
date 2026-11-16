@@ -1,23 +1,22 @@
 #!/bin/sh
-# keepctl - manage the MINAS self-heal timer without editing systemd files.
+# keepctl —— 自愈定时器的管理命令，不用手改 systemd 文件。
 #
-# Two schedule modes are supported and can be switched at any time:
-#   interval  run every N (e.g. 2min)  -> systemd OnUnitActiveSec
-#   calendar  run at fixed clock times -> systemd OnCalendar
+# 支持两种调度模式，随时可切换：
+#   interval  每隔一段时间跑一次（如 2min）→ systemd OnUnitActiveSec
+#   calendar  每天固定时间点跑             → systemd OnCalendar
 #
-# Config lives in keep.conf (same directory). This script applies it to the
-# systemd timer and reports status. Changes persist across reboots because the
-# timer unit and keep.conf both live on the persistent overlay.
+# 配置保存在同目录的 keep.conf。本脚本负责把它应用到 systemd 定时器。
+# 定时器单元和 keep.conf 都在持久层（/data 的 overlay upper），重启不丢。
 #
-# Usage:
-#   keepctl status                 show mode, interval/calendar, enabled, next run
-#   keepctl set 2min               switch to interval mode (30s / 2min / 1h)
-#   keepctl at 08,12,15,18:00      switch to calendar mode (daily at these times)
-#   keepctl at "Mon..Fri 09:00"    calendar with weekday restriction
-#   keepctl off                    disable the self-heal timer (persists)
-#   keepctl on                     re-enable the self-heal timer
-#   keepctl apply                  apply hand-edited keep.conf values
-#   keepctl run                    run one heal pass right now
+# 用法：
+#   keepctl status                 查看模式、间隔/时间点、启用状态、下次运行
+#   keepctl set 2min               切到间隔模式（支持 30s / 2min / 1h）
+#   keepctl at 08,12,15,18:00      切到日历模式（每天这些时间点）
+#   keepctl at "Mon..Fri 09:00"    日历模式 + 限定工作日
+#   keepctl off                    停用自愈（重启后保持停用）
+#   keepctl on                     重新启用
+#   keepctl apply                  手改 keep.conf 后应用
+#   keepctl run                    立即手动跑一次巡检
 
 DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 CONF="$DIR/keep.conf"

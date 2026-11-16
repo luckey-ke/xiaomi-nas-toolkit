@@ -1,6 +1,7 @@
 # 本地配置：含设备 IP / UID / 密码，绝不入库
 config/config.json
 config/*.local.json
+config/.state.json
 
 # 上游第三方代码与二进制：由 bootstrap 拉取，不进本仓库
 vendor/
