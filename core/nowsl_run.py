@@ -148,6 +148,34 @@ def patch_root(mod):
     mod._cleanup_via_shell = cleanup
 
 
+def relax_strict_x509():
+    """放宽 X.509 严格模式，兼容新版 Python/OpenSSL。
+
+    Python 3.13 起的 OpenSSL 3.5 默认开启 X509_STRICT，而厂商 CA 证书的
+    basicConstraints 扩展没有标记为 critical，于是任何用 CA 链校验的握手都会
+    报 "Basic Constraints of CA cert not marked critical"——这不是中间人攻击
+    信号，只是厂商证书不合规。
+
+    这里只撤掉"严格位"：CA 链校验、有效期、主机名（SAN）校验全部保留。
+    副作用仅限本进程。
+    """
+    flag = getattr(ssl, "VERIFY_X509_STRICT", None)
+    if flag is None:
+        return False
+    original = ssl.create_default_context
+
+    def patched(*args, **kwargs):
+        ctx = original(*args, **kwargs)
+        try:
+            ctx.verify_flags = ctx.verify_flags & ~flag
+        except Exception:
+            pass
+        return ctx
+
+    ssl.create_default_context = patched
+    return True
+
+
 def cert_paths(cfg):
     access = cfg.get("access") or {}
     cert_dir = access.get("cert_dir") or os.path.expandvars(r"%LOCALAPPDATA%\minasCert")
@@ -387,6 +415,10 @@ def main():
         print(__doc__)
         return 0
     kind, rest = sys.argv[1], sys.argv[2:]
+    if kind in ("probe", "info", "root", "deploy", "exec"):
+        if relax_strict_x509() and kind in ("probe", "info"):
+            print("提示: 已放宽 X.509 严格校验（厂商 CA 的 basicConstraints 未标 critical）；"
+                  "CA 链与主机名校验仍然有效", file=sys.stderr)
     if kind == "selftest":
         return selftest()
     if kind == "probe":
@@ -396,6 +428,20 @@ def main():
             if idx + 1 < len(rest):
                 host = rest[idx + 1]
         return probe(passive_only="--passive" in rest, host=host)
+    if kind == "info":
+        # 只读取身份（SN / UID），供部署脚本自动补全配置。不写设备。
+        cfg = load_config()
+        host = (cfg.get("device") or {}).get("host")
+        if not host:
+            die("配置里没有 device.host")
+        mod = load_module("minas_root_info", find_root_tool())
+        try:
+            nas = mod.Nas(host, str(cert_paths(cfg)))
+        except Exception as exc:
+            die("证书会话失败：%s" % exc)
+        print("SN=%s" % (nas.sn or ""))
+        print("UID=%s" % (nas.uid or ""))
+        return 0
     if kind == "deploy":
         cfg = load_config()
         write_deploy_config(cfg)

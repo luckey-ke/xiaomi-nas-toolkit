@@ -183,6 +183,9 @@ keepctl apply         # 手改 keep.conf 后让它生效
 **Q：`scp` 能用吗？**
 能。修补版 dropbear 的服务端配合标准 `scp` 可正常传输（本项目的部署流程本身就靠它）。若你的 OpenSSH 版本较新报 SFTP 错误，用 `scp -O` 走旧协议。
 
+**Q：Python 3.13 能跑吗？**
+能。Python 3.13 起 OpenSSL 3.5 默认开启 `X509_STRICT`，而厂商 CA 证书的 `basicConstraints` 没标 `critical`，直接跑上游工具会报 `Basic Constraints of CA cert not marked critical`。本项目的 `nowsl_run.py` 已内置兼容（只撤掉严格位，CA 链与主机名校验保留），无需降级 Python。详见 [docs/04-运维手册.md](docs/04-运维手册.md#python-313--openssl-35-的证书兼容问题)。
+
 ---
 
 ## 卸载

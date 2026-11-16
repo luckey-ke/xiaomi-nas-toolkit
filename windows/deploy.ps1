@@ -130,6 +130,24 @@ function Assert-Cfg {
     return $cfg
 }
 
+function Resolve-Identity {
+    $cfg = Assert-Cfg
+    if ($cfg.device.uid -and $cfg.device.sn) { return }
+    Info '解析设备身份（SN / UID），只读证书会话'
+    $out = Invoke-Py @((Join-Path $script:Core 'nowsl_run.py'), 'info') -AllowFail -Quiet
+    $text = ($out | Out-String)
+    $uidMatch = [regex]::Match($text, 'UID=(\S+)')
+    $snMatch = [regex]::Match($text, 'SN=(\S+)')
+    if ($uidMatch.Success -and -not $cfg.device.uid) { $cfg.device.uid = $uidMatch.Groups[1].Value }
+    if ($snMatch.Success -and -not $cfg.device.sn) { $cfg.device.sn = $snMatch.Groups[1].Value }
+    if ($cfg.device.uid) {
+        Save-Cfg
+        Ok "UID=$($cfg.device.uid)   SN=$($cfg.device.sn)"
+    } else {
+        Warn '未能自动解析 UID，请手工填写配置里的 device.uid'
+    }
+}
+
 # ---------- 基础动作 ----------
 function Invoke-Py {
     param([string[]]$PyArgs, [switch]$AllowFail, [switch]$Quiet)
@@ -237,6 +255,8 @@ function Invoke-Check {
     $key = $cfg.access.key_path
     $keyOk = (Test-Path $key) -and (Test-Path "$key.pub")
     if ($keyOk) { Ok "SSH 私钥：$key" } else { Warn "私钥不存在（$key），root 阶段会自动生成" }
+
+    Resolve-Identity
 }
 
 # ---------- 阶段：probe ----------
@@ -331,7 +351,7 @@ function Invoke-Plugins {
     Info "将安装：$($enabled -join ', ')"
 
     $select = ($enabled -join ',')
-    Invoke-Py @((Join-Path $script:Core 'nowsl_run.py'), 'deploy', '--select', $select, '--yes')
+    Invoke-Py @((Join-Path $script:Core 'nowsl_run.py'), 'deploy', '--select', $select)
     Ok '插件安装流程结束'
 }
 
@@ -384,7 +404,10 @@ function Build-Stage {
 function Invoke-Stack {
     Step '阶段 6/7 部署稳定性栈'
     $cfg = Assert-Cfg
-    if (-not $cfg.device.uid) { Stop-Here '配置缺少 device.uid' '跑一次 -Stage check 让 probe 解析出 UID' }
+    if (-not $cfg.device.uid) { Resolve-Identity }
+    if (-not $cfg.device.uid) {
+        Stop-Here '配置缺少 device.uid（自研插件的用户目录名依赖它）' '手工填入米家数字 UID 后重跑 -Stage stack'
+    }
 
     $stageLocal = Build-Stage
     Info '上传组件到 NAS'

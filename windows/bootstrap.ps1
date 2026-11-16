@@ -46,6 +46,11 @@ if ((Test-Path $deployTool) -and -not $Force) {
     Say "[skip] 上游代码已存在：$Vendor" 'DarkGray'
     exit 0
 }
+# 存在但不完整（例如上次中断）时先清掉，否则 git clone 会因目录非空失败
+if ((Test-Path $Vendor) -and -not (Test-Path $deployTool)) {
+    Say "[reset] vendor/upstream 不完整，清理后重拉" 'Yellow'
+    Remove-Item $Vendor -Recurse -Force
+}
 if ($Force -and (Test-Path $Vendor)) {
     Say "[reset] 删除旧的 vendor/upstream" 'Yellow'
     Remove-Item $Vendor -Recurse -Force
