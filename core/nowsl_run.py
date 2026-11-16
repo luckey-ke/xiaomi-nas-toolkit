@@ -68,6 +68,15 @@ def find_deploy_tool():
     return path
 
 
+def tcp_open(host, port, timeout=3):
+    """探测 TCP 端口是否可连通（用于判断 2323 root shell 是否在线）。"""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def tcp_shell(host, port, payload, timeout=60):
     """把字节流送进 socat root shell，收集全部文本输出。"""
     data = payload.encode("utf-8") if isinstance(payload, str) else payload
@@ -390,8 +399,14 @@ def shlex_quote(text):
     return "'" + text.replace("'", "'\\''") + "'"
 
 
-def write_deploy_config(cfg):
-    """把统一配置翻译成上游 deploy-plugins.py 认识的格式。"""
+def write_deploy_config(cfg, channel):
+    """把统一配置翻译成上游 deploy-plugins.py 认识的格式。
+
+    transport 是 SSH 的运行环境（auto/native/wsl），不能填 socat——
+    socat 是 channel（执行通道）的取值，两者是不同维度。
+    transport 固定 native：本项目就是给「没有/不用 WSL」的 Windows 准备的，
+    auto 在装有 wsl.exe 的机器上（哪怕 WSL 功能没启用）会误选 wsl 直接炸。
+    """
     device = cfg.get("device") or {}
     access = cfg.get("access") or {}
     target = VENDOR / "deploy-config.json"
@@ -401,8 +416,8 @@ def write_deploy_config(cfg):
         "ssh_key": access.get("key_path") or "",
         "user": access.get("ssh_user") or "root",
         "port": int(access.get("ssh_port") or 22),
-        "transport": "socat",
-        "channel": "socat",
+        "transport": "native",
+        "channel": channel,
         "shell_port": int(device.get("shell_port") or 2323),
         "cert_dir": access.get("cert_dir") or "",
     }
@@ -444,9 +459,18 @@ def main():
         return 0
     if kind == "deploy":
         cfg = load_config()
-        write_deploy_config(cfg)
+        # 通道按现场情况选：刚 root 完 2323 还活着 → socat（对 dropbear 的
+        # exec bug 免疫）；设备已部署过、2323 已关闭 → 走已固化的 SSH。
+        device = cfg.get("device") or {}
+        host = device.get("host") or ""
+        shell_port = int(device.get("shell_port") or 2323)
+        channel = "socat" if tcp_open(host, shell_port, timeout=3) else "ssh"
+        print("部署通道：%s（%s）" % (channel, "2323 root shell 在线" if channel == "socat" else "2323 不在线，走 SSH"))
+        write_deploy_config(cfg, channel)
         mod = load_module("minas_deploy", find_deploy_tool())
         patch_deploy(mod)
+        if "--channel" not in rest:
+            rest = rest + ["--channel", channel]
         return mod.main(argv=rest)
     if kind == "root":
         cfg = load_config()
