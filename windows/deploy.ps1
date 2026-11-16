@@ -349,24 +349,53 @@ function 步骤-寻找设备 {
 }
 
 # ============================================================
-# 第 3 步：root（已部署过会自动跳过）
+# 第 3 步：root（已 root / 已部署过的设备会被识别出来，由你决定跳不跳）
+#
+# 三种情况：
+#   A. SSH 已可用          → 之前完整部署过，自动跳过，不打扰
+#   B. root 通道(2323)在线  → 刚 root 过还没重启，问你是否跳过（默认跳过）
+#   C. 都不通但以前 root 过 → root 是临时的、重启即失效，提示后走正常 root 流程
 # ============================================================
 function 步骤-获取root {
     说-步骤 '第 3 步 / 共 6 步：获取设备控制权（root）'
 
+    # 情况 A：SSH 免密已可用，说明 root + 固化都做过，直接跳过
     if (测-SSH可用) {
         说-成功 '检测到这台 NAS 已经部署过了，跳过 root'
         标记-完成 'root'; 标记-完成 'ssh'; return
     }
 
-    # 先解析设备身份（UID/SN），后面装插件要用
-    说-信息 '读取设备身份信息'
-    $身份 = 跑-Python @((Join-Path $script:Core 'nowsl_run.py'), 'info') -允许失败 -静默
-    $文本 = ($身份 | Out-String)
     $cfg = 读-配置
-    if ($文本 -match 'UID=(\S+)') { $cfg.device.uid = $Matches[1] }
-    if ($文本 -match 'SN=(\S+)')  { $cfg.device.sn  = $Matches[1] }
-    if ($cfg.device.uid) { 写-配置 $cfg; 说-成功 "设备身份确认（UID=$($cfg.device.uid)）" }
+
+    # 先解析设备身份（UID/SN），后面装插件要用；配置里已有就不重复读
+    if (-not $cfg.device.uid) {
+        说-信息 '读取设备身份信息'
+        $身份 = 跑-Python @((Join-Path $script:Core 'nowsl_run.py'), 'info') -允许失败 -静默
+        $文本 = ($身份 | Out-String)
+        if ($文本 -match 'UID=(\S+)') { $cfg.device.uid = $Matches[1] }
+        if ($文本 -match 'SN=(\S+)')  { $cfg.device.sn  = $Matches[1] }
+        if ($cfg.device.uid) { 写-配置 $cfg; 说-成功 "设备身份确认（UID=$($cfg.device.uid)）" }
+    }
+
+    # 情况 B：root 通道还活着（root 是临时的，说明这台设备刚 root 过、还没重启）。
+    # 重复 root 没有必要，默认建议跳过；你想重新来一遍也可以选 n。
+    if (-not $Force -and (测-端口 $cfg.device.host ([int]$cfg.device.shell_port) 1500)) {
+        说-成功 '检测到设备已处于 root 状态（root 通道在线，本次开机已 root 过）'
+        if ($Yes) {
+            说-信息 '自动跳过重复 root'
+            标记-完成 'root'; return
+        }
+        $答 = 询问 '跳过重复 root、直接进入下一步？(y=跳过 / n=重新 root)' 'y'
+        if ($答 -match '^(y|yes|是)$') {
+            标记-完成 'root'; return
+        }
+        说-警告 '将重新执行 root；若工具因通道被占用而失败，改选跳过即可'
+    }
+
+    # 情况 C：之前 root 过但重启了——root 不持久，需要重新获取
+    if (Test-完成 'root') {
+        说-信息 '这台设备之前 root 过；root 是临时的，重启后已失效，现在重新获取'
+    }
 
     # 写预演：确认注入链在这台设备上仍然有效，不通过就停手
     说-信息 '安全检查：验证注入通道（约 10 秒，不会对设备做任何修改）'
