@@ -57,6 +57,9 @@
 全程约 6~10 分钟。中途失败了照着屏幕上的 numbered 建议做，修好重新双击即可——
 已完成的步骤会自动跳过，不会重复折腾。
 
+> 设备**已经 root 过**？直接双击就行：脚本会识别出来——已部署完成的自动跳过；
+> 本次开机已 root 的会问你要不要跳过（回车默认跳过）。重复执行是安全的。
+
 结束后：
 
 ```powershell
@@ -79,7 +82,7 @@ powershell -ExecutionPolicy Bypass -File windows\deploy.ps1 -Stage check
 |---|---|---|
 | `check` | 环境自检：Python / 证书 / 上游代码 / 配置 / 443 可达 | 否 |
 | `probe` | 只读预检 + **写预演**（建一个含 `%0A` 的目录再删掉，验证注入链还在） | 预演写一个目录并删除 |
-| `root` | 执行漏洞利用，拿到临时 root shell（2323） | 是（会留下公钥） |
+| `root` | 执行漏洞利用，拿到临时 root shell（2323）；已 root/已部署会自动识别并询问 | 是（会留下公钥） |
 | `ssh` | 修补 dropbear、写 systemd 单元、装开机钩子、注入公钥、可选设密码 | 是 |
 | `plugins` | 安装 `dockerctl` / `sysmon` / `pcbackup` | 是 |
 | `stack` | 目录守卫 + 自愈定时器 + 运行时迁移，含一次真实对账 | 是 |
