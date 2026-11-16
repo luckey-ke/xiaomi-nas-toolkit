@@ -4,6 +4,16 @@
 
 面向固件 **1.0.9.464.F24C26D24-REL** 实测（1.0.9.x 系列原理相同，新固件需重新评估）。
 
+<p align="center">
+  <img src="docs/images/plugin-market.png" width="720" alt="应用市场：自研插件以「打开」状态常驻">
+  <br><sub>部署完成后的应用市场：自研插件（Docker 控制台 / 系统状态 / PC 备份）以「打开」状态常驻，不再出现"需要下载"</sub>
+</p>
+
+<p align="center">
+  <img src="docs/images/firmware-1.0.9.464.png" width="720" alt="实测固件：1.0.9.464.F24C26D24-REL，固件自动更新已关闭">
+  <br><sub>实测环境：固件 1.0.9.464.F24C26D24-REL，固件自动更新已关闭（建议保持关闭，原因见 docs/05-风险与边界.md）</sub>
+</p>
+
 ---
 
 ## ⚠️ 先读这段
