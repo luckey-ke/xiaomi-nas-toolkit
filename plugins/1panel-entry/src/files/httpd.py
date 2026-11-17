@@ -18,6 +18,7 @@
     其他                → 静态文件（src/ui，即镜像后的 1Panel 前端）
 """
 
+import base64
 import http.client
 import json
 import os
@@ -26,6 +27,7 @@ import select
 import socket
 import threading
 import time
+import urllib.parse
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("PLUG_PORT", "9304"))
@@ -33,6 +35,10 @@ BIND_HOST = os.environ.get("BIND_HOST", "0.0.0.0")
 PANEL_HOST = os.environ.get("PANEL_HOST", "127.0.0.1")
 PANEL_PORT = int(os.environ.get("PANEL_PORT", "18080"))
 PANEL_TIMEOUT = int(os.environ.get("PANEL_TIMEOUT", "300"))
+# 1Panel 的安全入口。面板前端是从 location.pathname 推导入口的，而插件页的
+# URL 是 /plugin/<uid>/1panel/index.html，推导结果必然是错的，导致登录报文里
+# 不带（或带错）EntranceCode，被后端判“安全入口信息错误”。这里给出兜底值。
+PANEL_ENTRANCE = os.environ.get("PANEL_ENTRANCE", "index")
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 UI_DIR = os.path.abspath(os.path.join(_HERE, "..", "ui"))
@@ -106,9 +112,7 @@ def encrypt_password(password, pub_cookie):
         aes = AES-256-CBC(password, key=n, iv)
         password 字段 = rsa:iv:aes（都 base64）
     """
-    import base64
     import os as _os
-    import urllib.parse
 
     from cryptography.hazmat.primitives import padding
     from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
@@ -157,6 +161,23 @@ def maybe_encrypt_login(key, path, body):
     return json.dumps(payload).encode("utf-8")
 
 
+
+def entrance_code(key):
+    """算出 1Panel 的 EntranceCode 头。
+
+    面板下发的 SecurityEntrance cookie 是 URL 编码过的 base64（如 aW5kZXg%3D），
+    直接当请求头发出去会被判“安全入口信息错误”，必须先解编码。cookie 不可用
+    （还没登录过）时退回配置里的入口名。
+    """
+    raw = jar_get(key, "SecurityEntrance")
+    if raw:
+        cand = urllib.parse.unquote(raw)
+        try:
+            base64.b64decode(cand + "=" * (-len(cand) % 4), validate=True)
+            return cand
+        except Exception:
+            pass
+    return base64.b64encode(PANEL_ENTRANCE.encode()).decode()
 
 def jar_header(key):
     with _jar_lock:
@@ -292,6 +313,13 @@ class Handler(SimpleHTTPRequestHandler):
                 token = jar_get(key, "pcsrftoken")
                 if token:
                     headers["X-CSRF-Token"] = token
+        # 安全入口：前端拿不到正确入口时会漏发这个头，面板直接判“安全入口信息错误”。
+        # 注意：前端自己也会发这个头（插件页 URL 推导出来的入口是错的），
+        # 所以这里必须无条件覆盖，不能只补空缺。
+        headers["EntranceCode"] = entrance_code(key)
+        for k in list(headers):
+            if k.lower() == "entrancecode" and k != "EntranceCode":
+                headers.pop(k)
         headers["Host"] = "%s:%d" % (PANEL_HOST, PANEL_PORT)
         headers["X-Real-IP"] = "127.0.0.1"
         headers["X-Forwarded-For"] = "127.0.0.1"

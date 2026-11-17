@@ -1,137 +1,644 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>1Panel</title>
-<style>
-  html, body { margin: 0; height: 100%; background: #12161c; overflow: hidden; }
-  #frame { width: 100%; height: 100%; border: 0; display: block; }
-  #veil {
-    position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
-    flex-direction: column; gap: 14px; color: #d7dee8;
-    font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
-    background: radial-gradient(circle at 50% 35%, #1b2430, #12161c 70%);
-  }
-  #veil.show { display: flex; }
-  #veil .dot { width: 46px; height: 46px; border-radius: 12px; background: #16b981;
-    display: flex; align-items: center; justify-content: center; color: #fff;
-    font-weight: 700; font-size: 20px; letter-spacing: .5px; box-shadow: 0 6px 18px rgba(22,185,129,.28); }
-  #veil h1 { font-size: 16px; font-weight: 600; margin: 0; }
-  #veil p { margin: 0; color: #8b98a8; max-width: 460px; text-align: center; }
-  #veil .row { display: flex; gap: 10px; }
-  #veil button { padding: 8px 18px; border-radius: 8px; cursor: pointer;
-    border: 1px solid #2a3542; background: #1b2430; color: #d7dee8; font-size: 13px; }
-  #veil button:hover { border-color: #16b981; color: #16b981; }
-  /* 诊断信息：出问题时才显示，方便截图定位 */
-  #diag { display: none; margin-top: 6px; font: 11px/1.5 ui-monospace, Consolas, monospace;
-    color: #6b7889; max-width: 560px; text-align: left; word-break: break-all; white-space: pre-wrap;
-    background: #0e1319; border: 1px solid #1e2731; border-radius: 6px; padding: 8px 10px; }
-</style>
-</head>
-<body>
-<iframe id="frame" allow="clipboard-read; clipboard-write"></iframe>
-<div id="veil">
-  <div class="dot">1P</div>
-  <h1 id="title">正在连接 1Panel…</h1>
-  <p id="hint">首次加载需要几秒</p>
-  <div class="row">
-    <button id="retry" type="button">重新加载</button>
-    <button id="open" type="button" style="display:none">直接打开面板</button>
-  </div>
-  <pre id="diag"></pre>
-</div>
+<html>
+    <head>
 <script>
+/* ───────────────────────── 1Panel 插件引导 ─────────────────────────
+   由 mirror_assets.py 注入到 1Panel 的 index.html，面板升级后重跑该脚本即可保留。
+   1) 把 location 归一到 1Panel 的 router base（客户端 URL 带 /D:/ 盘符前缀）；
+   2) 修正客户端给错的视口尺寸（fit）；
+   3) 侧边栏兜底样式（sidebarGuard）；
+   4) 清掉 element-plus 残留在 body 上的错误宽度锁（bodyFix）；
+   5) 原生桥 hs_AppCallWeb 的透传记录（App 用它通知页面，如"返回"）；
+   6) 出错时在页面上给出可截图的诊断；
+   7) 把运行环境 / 越界元素回报到 nginx 访问日志（/diag?v=13）。 */
 (function () {
-  var frame = document.getElementById('frame');
-  var veil = document.getElementById('veil');
-  var title = document.getElementById('title');
-  var hint = document.getElementById('hint');
-  var retry = document.getElementById('retry');
-  var open = document.getElementById('open');
-  var diag = document.getElementById('diag');
-
-  // 应用市场客户端（Electron）走本机代理加载插件页，页面真实 URL 形如
-  //   http://127.0.0.1:50538/D:/plugin/981760641/1panel/index.html
-  // 其中 /D:/ 是客户端给 NAS 分配的盘符前缀。相对路径会被解析成
-  // /D:/plugin/... 而 nginx 没有该路由（实测 404），所以这里一律用
-  // 从 pathname 里抠出来的绝对前缀，绝不依赖相对路径。
-  var BASE = (function () {
-    var m = location.pathname.match(/\/plugin\/[^\/]+\/1panel/);
-    return m ? m[0] : '/plugin/981760641/1panel';
+  var BASE = '/plugin/981760641/1panel/';
+  var errs = [];
+  var OP = location.pathname + location.search + location.hash;   /* 归一前的原始 URL */
+  var OPNAV = (function () {
+    try { var n = performance.getEntriesByType('navigation')[0]; return n ? n.type : '-'; } catch (e) { return '-'; }
   })();
-  var PANEL = BASE + '/panel/';
-  var HEALTH = BASE + '/health?t=';
 
-  function log(s) {
-    diag.textContent += s + '\n';
+  /* 上报：普通情况用 Image（GET，进 access.log）；卸载前用 sendBeacon 保证发出 */
+  function beaconUrl(tag, obj) {
+    var q = Object.keys(obj).map(function (k) {
+      return k + '=' + encodeURIComponent(obj[k] == null ? '-' : obj[k]);
+    }).join('&');
+    return BASE + 'diag?v=13&tag=' + tag + '&' + q + '&t=' + Date.now();
   }
-
-  function show(msg, tip, detail) {
-    title.textContent = msg;
-    hint.textContent = tip || '';
-    if (detail) { diag.style.display = 'block'; log(detail); }
-    veil.classList.add('show');
-  }
-
-  function hide() { veil.classList.remove('show'); }
-
-  function frameFilled() {
+  function beacon(tag, obj) { try { (new Image()).src = beaconUrl(tag, obj); } catch (e) {} }
+  function beaconBye(tag, obj) {
     try {
-      var d = frame.contentDocument;
-      return !!(d && d.body && d.body.childElementCount > 0);
-    } catch (e) { return false; }
+      var u = beaconUrl(tag, obj);
+      if (navigator.sendBeacon && navigator.sendBeacon(u)) { return; }
+      (new Image()).src = u;
+    } catch (e) {}
   }
 
-  function load() {
-    veil.classList.remove('show');
-    diag.textContent = '';
-    diag.style.display = 'none';
-    open.style.display = 'none';
-    log('URL   = ' + location.href);
-    log('BASE  = ' + BASE);
-    log('PANEL = ' + PANEL);
+  /* 1) URL 归一
+     客户端给的是 /D:/plugin/981760641/1panel/…（盘符前缀），micro-app 有时还会
+     把绝对地址再拼一次（前缀重复）。这里统一裁到 base 开头，并去掉 index.html。
+     注意：这一步只是"尽量改对"，micro-app 的虚拟路由可能拦截 history，改不动；
+     所以后面还有 routeFix() 用应用自己的 router 做兜底。 */
+  function normPath() {
+    var p = location.pathname, i = p.indexOf('/plugin/');
+    var t = i >= 0 ? p.slice(i) : BASE;
+    var rest = t.slice(BASE.length).replace(/\/plugin\/981760641\/1panel\/?/g, '');
+    t = BASE + rest.replace(/^\/+/, '');
+    if (t.slice(-10).toLowerCase() === 'index.html') { t = t.slice(0, -10) || BASE; }
+    if (t.indexOf(BASE) !== 0) { t = BASE; }
+    return t;
+  }
+  var NORM = { from: OP, to: '', ok: 0 };
+  try {
+    var want = normPath();
+    NORM.to = want;
+    if (want !== location.pathname) {
+      history.replaceState(null, '', want + location.search + location.hash);
+    }
+    NORM.ok = location.pathname === want ? 1 : 0;
+  } catch (e) { errs.push('norm:' + e.message); }
+  beacon('init', { op: OP, nav: OPNAV, ok: NORM.ok, to: NORM.to, ref: document.referrer || '-' });
 
-    var done = false;
-    frame.onload = function () {
-      log('iframe onload, body=' + (frameFilled() ? 'ok' : 'empty'));
-      if (frameFilled()) { done = true; hide(); }
+  /* 记录 history 调用：点按钮后若发生 URL 变化，能直接看到是谁改的 */
+  (function histTrace() {
+    ['pushState', 'replaceState'].forEach(function (m) {
+      try {
+        var orig = history[m];
+        history[m] = function (s, t, u) {
+          if (errs.length < 40) { errs.push('HIST:' + m + ':' + String(u || '-').slice(0, 60)); }
+          return orig.apply(this, arguments);
+        };
+      } catch (e) {}
+    });
+  })();
+
+  /* 2) 视口修正
+     应用市场客户端（Electron）会把 webview 的 zoomFactor 设成 0.8 —— 于是
+     innerWidth = 窗口设备宽 / 0.8；dpr 也报 0.8。窗口从大变小后，webview 的
+     视口不一定跟着变，页面就按更大的尺寸渲染，右侧被窗口切掉。
+     判据：outerWidth/outerHeight 在客户端报的是**设备像素**，除以 dpr 才是可见 CSS 尺寸。
+     做法：视口确实比可见区大 → 钉住布局尺寸 + 等比缩放。
+     正常浏览器 outerWidth ≥ innerWidth、dpr ≥ 1，这段永不触发。 */
+  var FIT = window.__fit = { iw: 0, ih: 0, ow: 0, oh: 0, realW: 0, realH: 0, dpr: 1, z: 1, fixed: 0 };
+  function fit() {
+    var de = document.documentElement;
+    /* 手机端直接跳过：手机 WebView 里 innerWidth=980(layout viewport)、
+       outerWidth=440(可视宽)、dpr=3 是正常特征，不是视口错误。
+       对它做 zoom 补偿会把完整页面压成左上角一小块 + 大片黑屏。
+       手机本身由 WebView 按 980 布局视口整页缩放显示，UI 本来就正常。 */
+    if (/iPhone|iPad|Android|Mobile/i.test(navigator.userAgent || '')) {
+      de.style.zoom = ''; de.style.width = ''; de.style.height = ''; de.style.overflow = '';
+      FIT.z = 1; FIT.fixed = 0;
+      return;
+    }
+    var num = function (v) { return (typeof v === 'number' && isFinite(v) && v > 100) ? Math.round(v) : 0; };
+    de.style.zoom = '';                    // 先复位，免得量到上次的形状
+    de.style.width = '';
+    de.style.height = '';
+    de.style.overflow = '';
+
+    var dpr = window.devicePixelRatio || 1;
+    var iw = num(window.innerWidth) || 1;
+    var ih = num(window.innerHeight) || 1;
+    var ow = num(window.outerWidth);
+    var oh = num(window.outerHeight);
+    var realW = ow ? (dpr < 0.95 ? Math.round(ow / dpr) : ow) : 0;
+    var realH = oh ? (dpr < 0.95 ? Math.round(oh / dpr) : oh) : 0;
+
+    FIT.iw = iw; FIT.ih = ih; FIT.ow = ow; FIT.oh = oh;
+    FIT.realW = realW; FIT.realH = realH; FIT.dpr = Math.round(dpr * 100) / 100;
+    FIT.z = 1; FIT.fixed = 0;
+
+    var z = 1;
+    if (realW && iw - realW > 16) { z = Math.min(z, realW / iw); }
+    if (realH && ih - realH > 16) { z = Math.min(z, realH / ih); }
+    if (z >= 0.97) { return; }             // 视口正常，什么都不做
+
+    z = Math.max(0.35, z);
+    de.style.zoom = z;
+    de.style.width = iw + 'px';
+    de.style.height = ih + 'px';
+    de.style.overflow = 'hidden';
+    FIT.z = Math.round(z * 1000) / 1000;
+    FIT.fixed = 1;
+  }
+  fit();
+  var rt = 0;
+  window.addEventListener('resize', function () {
+    clearTimeout(rt);
+    rt = setTimeout(function () { fit(); probe('resize'); }, 300);
+  });
+
+  /* 3) 侧边栏兜底：规避 el-menu 折叠/展开动画在客户端里卡住导致整块空白。
+     写的都是"本来就该是"的值，正常情况无副作用。 */
+  (function sidebarGuard() {
+    var st = document.createElement('style');
+    st.textContent = '.app-sidebar,.app-sidebar .sidebar-container,.app-sidebar .el-scrollbar__view,'
+      + '.app-sidebar .el-menu,.app-sidebar .el-menu-item,.app-sidebar .el-sub-menu__title,'
+      + '.app-sidebar .logo,.app-sidebar .user-actions,.app-sidebar .node-selector'
+      + '{opacity:1!important;visibility:visible!important}'
+      /* 折叠按钮在 el-affix 里，而 .app-sidebar 是 z-index:2 的 fixed 层。
+         客户端里 logo 的 SVG 盖在按钮上，只露半个圆，点击落到 logo
+         （logo 的 onClick = router.push('home',{t}) → 看起来像整页刷新）。
+         把 affix 提到侧边栏之上，按钮即可完整显示并命中。 */
+      + '.app-wrapper > .el-affix,.app-wrapper .el-affix--fixed{z-index:2100!important}'
+      + '.app-wrapper .el-affix--fixed button,.app-wrapper button.el-tooltip__trigger'
+      + '{z-index:2101!important;pointer-events:auto!important}';
+    (document.head || document.documentElement).appendChild(st);
+  })();
+
+  /* 3.1) 折叠按钮点击兜底
+     上面提高层级后按钮一般能直接点到；但客户端里 logo 的 svg 仍可能抢走事件，
+     于是在捕获阶段判断：点击落在 logo 内、且横坐标处于按钮所在区域（侧边栏
+     logo 右缘 ~24px）时，直接触发 1Panel 自己的 setCollapse（通过点击真按钮），
+     并阻止事件继续传到 logo，避免误跳 home。 */
+  (function foldGuard() {
+    var armed = false;
+    document.addEventListener('click', function (e) {
+      if (!armed) { return; }
+      var logo = document.querySelector('.app-sidebar .logo');
+      if (!logo) { return; }
+      var lr = logo.getBoundingClientRect();
+      /* 不依赖 e.target.closest（SVG path 上没有），直接用坐标判断是否点在 logo 上 */
+      if (e.clientX < lr.left || e.clientX > lr.right
+          || e.clientY < lr.top || e.clientY > lr.bottom) { return; }
+      /* 按钮中心正好在 logo 右缘（按钮范围 lr.right ± 12），
+         实测客户端点击 x=178 时 logo.right=180、x=248 时 logo.right=251 */
+      if (e.clientX < lr.right - 18 || e.clientX > lr.right + 8) { return; }
+      var btn = document.querySelector('.app-wrapper .el-affix--fixed button') || document.querySelector('.app-wrapper button.el-tooltip__trigger');
+      if (!btn) { return; }
+      try {
+        e.preventDefault(); e.stopPropagation();
+        btn.click();
+        errs.push('FOLDGUARD');
+        beacon('fg', { x: Math.round(e.clientX), wrap: (document.querySelector('.app-wrapper') || {}).className || '-' });
+      } catch (x) {}
+    }, true);   /* 捕获阶段，抢在 logo 的 onClick 之前 */
+    setTimeout(function () { armed = true; }, 1200);
+  })();
+
+  /* 3.5) micro-app 容器修正
+     PC 客户端是用微前端容器（micro-app）把插件页面嵌进去的：实测页面里存在
+     <micro-app-body>，宽 1088、left -26，而窗口视口是 1440。
+     body 只有 1088，1Panel 的布局按 1088 排（正确），但它的侧边栏/抽屉/弹层都是
+     position:fixed —— fixed 的参照是**视口**（1440），两套坐标系差 352px，
+     于是侧边栏画到了容器外面，压在客户端自己的界面上，看起来就是"树形菜单跑到
+     1Panel 窗口外侧"。
+     给容器加一个空 transform 会让它变成 fixed 后代的 containing block，
+     fixed 就回到容器坐标系里，宽度/位置都和内容对齐。
+     注：transform 不参与布局，加它不会改变任何盒子尺寸。 */
+  function microGuard() {
+    var mb = document.querySelector('micro-app-body');
+    var env = !!window.__MICRO_APP_ENVIRONMENT__ || !!mb;
+    if (!env) { return; }
+    var list = [];
+    if (mb) { list.push(mb); }
+    if (document.body && document.body !== mb) { list.push(document.body); }
+    for (var k = 0; k < list.length; k++) {
+      var el = list[k];
+      if (!el || el.__p1tz) { continue; }
+      el.__p1tz = 1;
+      el.style.transform = 'translateZ(0)';
+      el.style.transformOrigin = '0 0';
+    }
+  }
+
+  /* 3.6) body 宽度锁修复
+     element-plus 的 useLockscreen 在弹窗/抽屉打开时会写
+       document.body.style.width = calc(100% - Npx)      // N = 滚动条宽
+     客户端里有一次把 N 算成了 352（页面曾被缩放，innerWidth 与
+     documentElement.clientWidth 不同单位），关闭后没恢复，body 就永远只有
+     视口宽 - 352。1Panel 用 document.body.clientWidth < 1200 判断折叠侧边栏，
+     于是侧边栏常年收成图标条、内容区只占窗口 75%，右侧留一条空白 ——
+     看上去就是"菜单跑到 1Panel 窗口外面去了"。
+     这里只清理明显不合理的值（> 40px）：正常滚动条（≤ 20px）原样保留。 */
+  var bodyFixed = 0;
+  function bodyFix() {
+    var b = document.body;
+    if (!b) { return; }
+    var de = document.documentElement;
+    var w = (b.style.width || '').trim();
+    var m = /^calc\(100%\s*-\s*([\d.]+)px\)$/i.exec(w);
+    var bad = m ? parseFloat(m[1]) > 40 : false;
+    /* micro-app 容器本身就比视口窄（实测 1088 vs 1440），差值不是错误，不能清 */
+    var isMicro = !!document.querySelector('micro-app-body') || !!window.__MICRO_APP_ENVIRONMENT__;
+    if (!bad && !isMicro && de.clientWidth && b.clientWidth && de.clientWidth - b.clientWidth > 40) { bad = true; }
+    if (!bad) { return; }
+    try {
+      b.style.width = '';
+      if (b.style.paddingRight) { b.style.paddingRight = ''; }
+      bodyFixed++;
+      errs.push('BODYFIX:' + (m ? Math.round(parseFloat(m[1])) : ('diff' + (de.clientWidth - b.clientWidth))));
+      window.dispatchEvent(new Event('resize'));   // 让 1Panel 重新按真实宽度算折叠状态
+    } catch (e) {}
+  }
+  (function initBodyFix() {
+    var start = function () {
+      microGuard();
+      [60, 300, 1200, 3000].forEach(function (t) { setTimeout(microGuard, t); });
+      bodyFix();
+      [120, 400, 1000, 2500, 5000, 9000].forEach(function (t) { setTimeout(bodyFix, t); });
+      try {
+        var bmo = new MutationObserver(function () { if (bodyFixed < 20) { bodyFix(); } });
+        bmo.observe(document.body, { attributes: true, attributeFilter: ['style'] });
+      } catch (e) {}
     };
-    frame.src = PANEL;
+    /* head 里的脚本执行时 body 还不存在，等 DOM 解析完再挂观察器 */
+    if (document.body) { start(); } else { document.addEventListener('DOMContentLoaded', start, { once: true }); }
+  })();
 
-    // 面板就绪探测：health 经 nginx → plugin.cgi → 1panel.cgi，探测 127.0.0.1:18080
-    var tries = 0;
-    (function probe() {
-      tries += 1;
-      fetch(HEALTH + Date.now(), { cache: 'no-store' })
-        .then(function (r) { return r.json(); })
-        .then(function (j) {
-          log('health#' + tries + ' up=' + (j && j.up));
-          if (j && j.up) { hide(); }
-          else if (tries < 4) { setTimeout(probe, 1200); }
-          else { show('1Panel 还没起来', '面板服务可能正在启动，稍等十几秒后点“重新加载”。'); }
-        })
-        .catch(function (e) {
-          log('health#' + tries + ' 失败 ' + e);
-          if (tries < 4) { setTimeout(probe, 1200); }
-        });
-    })();
-
-    // 看门狗：iframe 一直空白（客户端可能禁用了内嵌框架）就改为在当前窗口
-    // 直接打开面板子路径；同源 https，不会再触发混合内容或端口拦截。
-    setTimeout(function () {
-      if (done || frameFilled() || veil.classList.contains('show')) { return; }
-      open.style.display = '';
-      show('正在打开面板…', '内嵌加载较慢，已改为直接打开。');
-      log('iframe 为空，跳转 ' + PANEL);
-      location.replace(PANEL);
-    }, 3500);
+  /* 4.5) 路由自愈
+     实测（1Panel v2.5）：首页路由是 `/`（name=home），**没有 /home 这个路径**。
+     访问路由表里不存在的路径时，1Panel 会跳到 /error/404，也就是界面上那句
+     "抱歉，您访问的页面不存在"。客户端打开插件时给的 URL 带 /D:/ 盘符前缀，
+     micro-app 的虚拟路由可能让前面的 replaceState 失效 → 路由解析不到 → 404。
+     这里在应用启动后拿它自己的 router 把脏路径 replace 回 `/`：
+       · 有 .not-container（404 视图）或当前路由是 error/404；
+       · URL 还带着 /D:/ 前缀；
+       · 路径以 /home 结尾（旧版本才会用，现在是非法路由）。
+     用 router.replace 而不是 location，避免整页重载。 */
+  function getRouter() {
+    try {
+      var el = document.getElementById('app');
+      var vm = el && el.__vue_app__;
+      var gp = vm && vm.config.globalProperties;
+      return (gp && gp.$router) || null;
+    } catch (e) { return null; }
   }
+  var routeFixed = 0;
+  function routeFix() {
+    if (routeFixed) { return; }
+    var r = getRouter();
+    if (!r) { return; }
+    var cur = r.currentRoute && r.currentRoute.value;
+    var p = location.pathname;
+    var bad = !!document.querySelector('.not-container')
+      || !!(cur && /(^|\/)error\/404/.test(cur.path || ''))
+      || /\/home$/i.test(p)
+      || p.indexOf('/D:') >= 0
+      || p.indexOf('/plugin/') !== 0;
+    if (!bad) { return; }
+    try {
+      r.replace('/');
+      routeFixed = 1;
+      errs.push('ROUTEFIX:' + ((cur && cur.fullPath) || '-') + '>' + p);
+      beacon('rf', { cur: (cur && cur.fullPath) || '-', p: p });
+    } catch (e) {}
+  }
+  window.__routeFix = routeFix;
+  [250, 700, 1400, 2500, 4000, 6500, 9000].forEach(function (t) { setTimeout(routeFix, t); });
 
-  retry.addEventListener('click', load);
-  open.addEventListener('click', function () { location.replace(PANEL); });
-  load();
+  /* 4.6) 点击 / 卸载轨迹（只在左上角区域记录，避免刷日志） */
+  (function trace() {
+    function cls(el) {
+      var c = (el.className && el.className.toString) ? el.className.toString() : '';
+      return el.tagName.toLowerCase() + (c ? '.' + c.split(' ')[0] : '');
+    }
+    function wrapCls() {
+      var w = document.querySelector('.app-wrapper');
+      return w ? w.className : '-';
+    }
+    document.addEventListener('click', function (e) {
+      try {
+        var t = e.target;
+        if (!t || !t.getBoundingClientRect) { return; }
+        var r = t.getBoundingClientRect();
+        if (r.left > 340 || r.top > 180) { return; }
+        var chain = [], n = t;
+        for (var i = 0; i < 4 && n; i++) { chain.push(cls(n)); n = n.parentElement; }
+        var info = {
+          x: Math.round(e.clientX), y: Math.round(e.clientY),
+          el: chain.join('<'), dp: e.defaultPrevented ? 1 : 0, wrap: wrapCls(), p: location.pathname
+        };
+        errs.push('CLK:' + info.el);
+        beacon('clk', info);
+        setTimeout(function () {
+          var s = document.querySelector('.app-sidebar');
+          beacon('clk2', {
+            wrap: wrapCls(),
+            side: s ? Math.round(s.getBoundingClientRect().width) : -1,
+            p: location.pathname
+          });
+        }, 700);
+      } catch (x) {}
+    }, true);
+    window.addEventListener('pagehide', function () {
+      beaconBye('bye', {
+        p: location.pathname + location.search,
+        last: (errs.slice(-3).join(' | ') || '-').slice(0, 170),
+        wrap: wrapCls()
+      });
+    });
+  })();
+
+  /* 5) 原生桥透传
+     手机 App（WKWebView）会往插件页面注入脚本，通过 window.hs_AppCallWeb 通知页面
+     事件（已实测到 App 调用 hs_AppCallWeb('changeTheme','light',1)）。如果这个函数
+     不存在，注入脚本会抛 ReferenceError，后续逻辑（包括返回按钮）全部中断 ——
+     表现就是"只能进、退不出去"。
+     这里放一个透明代理：记录调用参数并立即上报（不等探针周期，点返回就能抓到），
+     再原样转交给 App 真实注册的实现（如果有）。 */
+  (function bridgeGuard() {
+    var real = (typeof window.hs_AppCallWeb === 'function') ? window.hs_AppCallWeb : null;
+    var conv = function (a) {
+      try { return typeof a === 'string' ? a : JSON.stringify(a); } catch (e) { return String(a); }
+    };
+    var proxy = function () {
+      var out = [];
+      for (var k = 0; k < arguments.length; k++) { out.push(conv(arguments[k])); }
+      var s = out.join('|').slice(0, 90);
+      errs.push('BR:' + s);
+      try { (new Image()).src = BASE + 'diag?v=13&tag=br&arg=' + encodeURIComponent(s) + '&t=' + Date.now(); } catch (e) {}
+      if (real) { try { return real.apply(window, arguments); } catch (e) {} }
+    };
+    try {
+      Object.defineProperty(window, 'hs_AppCallWeb', {
+        configurable: true,
+        get: function () { return proxy; },
+        set: function (v) { errs.push('BR-SET:' + typeof v); real = v; }
+      });
+    } catch (e) {}
+    window.addEventListener('message', function (e) {
+      try {
+        var d = conv(e.data).slice(0, 40);
+        errs.push('MSG:' + d);
+        (new Image()).src = BASE + 'diag?v=13&tag=msg&arg=' + encodeURIComponent(d) + '&t=' + Date.now();
+      } catch (x) {}
+    });
+  })();
+
+  /* 6) 错误兜底：只有在真的没挂载时才会盖住页面 */
+  window.addEventListener('error', function (e) {
+    if (e && e.target && e.target.tagName) {
+      errs.push('资源加载失败: ' + (e.target.src || e.target.href || e.target.tagName));
+      return;
+    }
+    errs.push((e.message || 'error') + ' @ ' + (e.filename || '') + ':' + (e.lineno || 0));
+  }, true);
+  window.addEventListener('unhandledrejection', function (e) {
+    var r = e.reason; errs.push('promise: ' + ((r && r.message) || r));
+  });
+  setTimeout(function () {
+    var app = document.getElementById('app');
+    var loading = document.querySelector('.first-loading-wrap');
+    if (!app || loading || app.children.length === 0) {
+      try {
+        var d = document.createElement('div');
+        d.setAttribute('style', 'position:fixed;z-index:2147483647;left:0;top:0;right:0;bottom:0;'
+          + 'background:#12161c;color:#d7dee8;font:13px/1.7 -apple-system,"PingFang SC",sans-serif;'
+          + 'padding:56px 40px;white-space:pre-wrap;word-break:break-all;overflow:auto');
+        d.textContent = '1Panel 前端没有挂载成功\n\nURL    = ' + location.href + '\nBASE   = ' + BASE
+          + '\nready  = ' + document.readyState + '\n视口   = ' + FIT.iw + 'x' + FIT.ih
+          + '\n窗口   = ' + FIT.ow + 'x' + FIT.oh + ' @' + FIT.dpr + ' zoom=' + FIT.z
+          + '\n错误   = ' + (errs.join('\n         ') || '无');
+        (document.body || document.documentElement).appendChild(d);
+      } catch (e) {}
+    }
+  }, 10000);
+
+  /* 7) 运行环境回报（只读，用于远程定位布局问题） */
+  function stack(x, y) {
+    try {
+      var els = document.elementsFromPoint(x, y) || [];
+      return els.slice(0, 3).map(function (e) {
+        var c = (e.className && e.className.toString ? e.className.toString() : '').split(' ')[0];
+        return e.tagName.toLowerCase() + (c ? '.' + c : '');
+      }).join('>');
+    } catch (e) { return '-'; }
+  }
+  function desc(el) {
+    if (!el) { return '-'; }
+    var cs = getComputedStyle(el), r = el.getBoundingClientRect();
+    return [(el.className || '').toString().split(' ')[0] || el.tagName.toLowerCase(),
+      Math.round(r.left) + ',' + Math.round(r.top) + ',' + Math.round(r.width) + 'x' + Math.round(r.height),
+      'op' + cs.opacity, cs.visibility.slice(0, 3), 'z' + cs.zIndex, cs.display,
+      cs.transform === 'none' ? 't0' : 'tx', cs.backgroundColor].join('|');
+  }
+  /* 找出画到可视区外面的元素：这是"菜单跑到窗口外"的直接证据 */
+  function overflow() {
+    var de = document.documentElement, W = de.clientWidth;
+    var out = [];
+    if (!W) { return '-'; }
+    var all = document.querySelectorAll('body *');
+    for (var i = 0; i < all.length && out.length < 5; i++) {
+      var e = all[i], r = e.getBoundingClientRect();
+      if (r.width < 6 || r.height < 6) { continue; }
+      if (r.right > W + 2 || r.left < -2) {
+        var cs = getComputedStyle(e);
+        var c = (e.className && e.className.toString ? e.className.toString() : '').split(' ')[0];
+        out.push(e.tagName.toLowerCase() + (c ? '.' + c : '')
+          + '[' + Math.round(r.left) + '~' + Math.round(r.right) + ' ' + cs.position.slice(0, 3) + ']');
+      }
+    }
+    return out.join(' ; ') || 'none';
+  }
+  function probe(tag) {
+    try {
+      var de = document.documentElement;
+      var b = document.body;
+      var side = document.querySelector('.app-sidebar');
+      var wrap = document.querySelector('.app-wrapper');
+      var mi = document.querySelector('.app-sidebar .el-menu-item');
+      var span = document.querySelector('.app-sidebar .el-menu-item span');
+      var logo = document.querySelector('.app-sidebar .logo');
+      var sb = side ? side.getBoundingClientRect() : null;
+      var vv = window.visualViewport;
+      var mh = '-';
+      try { mh = Object.keys((window.webkit && window.webkit.messageHandlers) || {}).join(',') || '-'; } catch (e) {}
+      var mbEl = document.querySelector('micro-app-body');
+      var hsG = '-';
+      try {
+        hsG = Object.keys(window).filter(function (k) { return /^hs|^_hs|AppCall/i.test(k); }).slice(0, 8).join(',') || '-';
+      } catch (e) {}
+      /* 手机端反向通道排查：App 可能用别的名字暴露 JSONBridge（不一定 hs 前缀） */
+      var wb = '-';
+      try {
+        wb = Object.keys(window).filter(function (k) {
+          if (!/^(hs|_hs)|app|bridge|native|android|ios|client|webview|jsbridge/i.test(k)) { return false; }
+          try { return typeof window[k] === 'function' || (window[k] && typeof window[k] === 'object'); } catch (e) { return false; }
+        }).slice(0, 12).join(',') || '-';
+      } catch (e) {}
+      var br = b ? b.getBoundingClientRect() : null;
+      var o = {
+        iw: FIT.iw, ih: FIT.ih, ow: FIT.ow, oh: FIT.oh, dpr: FIT.dpr, z: FIT.z, f: FIT.fixed,
+        dcw: de.clientWidth, dch: de.clientHeight, dsw: de.scrollWidth,
+        bcw: b ? b.clientWidth : '-', bsw: b ? b.scrollWidth : '-',
+        biw: b ? (b.style.width || '-') : '-', bpr: b ? (b.style.paddingRight || '-') : '-',
+        bcs: b ? getComputedStyle(b).width : '-', bfx: bodyFixed,
+        vvw: vv ? Math.round(vv.width) : '-',
+        scr: (window.screen ? screen.width + 'x' + screen.height : '-'),
+        sav: (window.screen ? screen.availWidth + 'x' + screen.availHeight : '-'),
+        mh: mh,
+        ma: mbEl ? desc(mbEl) : '-',
+        maP: (mbEl && mbEl.parentElement) ? mbEl.parentElement.tagName.toLowerCase() : '-',
+        maE: window.__MICRO_APP_ENVIRONMENT__ ? 1 : 0,
+        bcr: br ? [Math.round(br.left), Math.round(br.top), Math.round(br.width), Math.round(br.height)].join(',') : '-',
+        hsG: hsG,
+        wb: wb,
+        op: (OP || '-').slice(0, 90),
+        nav: OPNAV,
+        lp: location.pathname + location.search,
+        rt: (function () {
+          var r = getRouter();
+          var c = r && r.currentRoute && r.currentRoute.value;
+          return c ? (c.name || '-') + '|' + c.fullPath : '-';
+        })(),
+        nf: document.querySelector('.not-container') ? 1 : 0,
+        rfx: routeFixed,
+        wrap: (wrap ? wrap.className : '-'),
+        side: desc(side),
+        kid: side && side.children[0] ? desc(side.children[0]) : '-',
+        logo: logo ? desc(logo) + '/kidW=' + (logo.firstElementChild ? Math.round(logo.firstElementChild.getBoundingClientRect().width) : -1) : '-',
+        mi: mi ? (getComputedStyle(mi).color + '/op' + getComputedStyle(mi).opacity + '/vis' + getComputedStyle(mi).visibility) : '-',
+        sp: span ? (getComputedStyle(span).color + '/fs' + getComputedStyle(span).fontSize
+          + '/w' + Math.round(span.getBoundingClientRect().width) + '/txt' + (span.innerText || '').slice(0, 6)) : '-',
+        ovf: overflow(),
+        hit1: sb ? stack(Math.round(sb.left + sb.width / 2), Math.round(sb.top + 40)) : '-',
+        hit2: sb ? stack(Math.round(sb.left + sb.width / 2), Math.round(sb.top + sb.height / 2)) : '-',
+        err: (function () {
+          var seen = {}, out = [];
+          for (var q = 0; q < errs.length && out.length < 6; q++) {
+            var t = errs[q].slice(0, 40);
+            if (!seen[t]) { seen[t] = 1; out.push(t); }
+          }
+          return out.join(' ; ');
+        })()
+      };
+      var q = Object.keys(o).map(function (k) { return k + '=' + encodeURIComponent(o[k]); }).join('&');
+      (new Image()).src = BASE + 'diag?v=13&tag=' + tag + '&' + q + '&t=' + Date.now();
+    } catch (e) {}
+  }
+  window.__probe = probe;
+  setTimeout(function () { probe('t5'); }, 5000);
+  setTimeout(function () { probe('t20'); }, 20000);
 })();
+
 </script>
-</body>
+
+        <meta charset="UTF-8" />
+        <meta name="robots" content="noindex,nofollow" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>loading...</title>
+      <script type="module" crossorigin src="/plugin/981760641/1panel/assets/js/index-CPXRtJ2Q.js"></script>
+      <link rel="modulepreload" crossorigin href="/plugin/981760641/1panel/assets/js/rolldown-runtime-C0FnF6B9.js">
+      <link rel="modulepreload" crossorigin href="/plugin/981760641/1panel/assets/js/vendor-element-plus-Cyd3k4L-.js">
+      <link rel="modulepreload" crossorigin href="/plugin/981760641/1panel/assets/js/preload-helper-Czpn1I53.js">
+      <link rel="modulepreload" crossorigin href="/plugin/981760641/1panel/assets/js/lang-BDkhzMfw.js">
+      <link rel="modulepreload" crossorigin href="/plugin/981760641/1panel/assets/js/useGlobalStore-fFSHbgDY.js">
+      <link rel="modulepreload" crossorigin href="/plugin/981760641/1panel/assets/js/_plugin-vue_export-helper-BDNMzG2s.js">
+      <link rel="modulepreload" crossorigin href="/plugin/981760641/1panel/assets/js/svg-icon-CfCjBP8h.js">
+      <link rel="modulepreload" crossorigin href="/plugin/981760641/1panel/assets/js/router-Ckk14G41.js">
+      <link rel="modulepreload" crossorigin href="/plugin/981760641/1panel/assets/js/layout-content-CBwrQn_l.js">
+      <link rel="modulepreload" crossorigin href="/plugin/981760641/1panel/assets/js/router-button-Db6Pfv8N.js">
+      <link rel="modulepreload" crossorigin href="/plugin/981760641/1panel/assets/js/shared-CciQ9DyN.js">
+      <link rel="modulepreload" crossorigin href="/plugin/981760641/1panel/assets/js/ComplexTable-B0QaFzND.js">
+      <link rel="modulepreload" crossorigin href="/plugin/981760641/1panel/assets/js/dialog-pro-Do0TduzP.js">
+      <link rel="modulepreload" crossorigin href="/plugin/981760641/1panel/assets/js/drawer-pro-C9nw1FxL.js">
+      <link rel="modulepreload" crossorigin href="/plugin/981760641/1panel/assets/js/del-dialog-p0oFtqj-.js">
+      <link rel="modulepreload" crossorigin href="/plugin/981760641/1panel/assets/js/clipboard-BGTNdflD.js">
+      <link rel="modulepreload" crossorigin href="/plugin/981760641/1panel/assets/js/copy-button-C3JCrnrh.js">
+      <link rel="modulepreload" crossorigin href="/plugin/981760641/1panel/assets/js/FuReadWriteSwitch-w7MBTa58.js">
+      <link rel="modulepreload" crossorigin href="/plugin/981760641/1panel/assets/js/FuDropdownItem-B2rWX7TX.js">
+      <link rel="modulepreload" crossorigin href="/plugin/981760641/1panel/assets/js/FuInputRwSwitch-ClUvR1MT.js">
+      <link rel="modulepreload" crossorigin href="/plugin/981760641/1panel/assets/js/FuSelectRwSwitch-NgtMxoeo.js">
+      <link rel="modulepreload" crossorigin href="/plugin/981760641/1panel/assets/js/FuStep-bOPA31EG.js">
+      <link rel="modulepreload" crossorigin href="/plugin/981760641/1panel/assets/js/TableRefresh-hr3uNkAx.js">
+      <link rel="modulepreload" crossorigin href="/plugin/981760641/1panel/assets/js/TableSearch-B9U8axNY.js">
+      <link rel="modulepreload" crossorigin href="/plugin/981760641/1panel/assets/js/TableSetting-BR4gYaTJ.js">
+      <link rel="modulepreload" crossorigin href="/plugin/981760641/1panel/assets/js/TableViewSwitch-CGF-W2Ut.js">
+      <link rel="stylesheet" crossorigin href="/plugin/981760641/1panel/assets/css/style-AMl44HOj.css">
+    </head>
+    <body>
+        <div id="app">
+            <style>
+                html,
+                body,
+                #app {
+                    width: 100%;
+                    height: 100%;
+                    padding: 0;
+                    margin: 0;
+                }
+                .first-loading-wrap {
+                    display: flex;
+                    flex-direction: column;
+                    align-items: center;
+                    justify-content: center;
+                    width: 100%;
+                    height: 100%;
+                }
+                .first-loading-wrap > h1 {
+                    font-size: 128px;
+                }
+                .first-loading-wrap .loading-wrap {
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 98px;
+                }
+                .dot {
+                    position: relative;
+                    box-sizing: border-box;
+                    display: inline-block;
+                    width: 32px;
+                    height: 32px;
+                    font-size: 32px;
+                    transform: rotate(45deg);
+                    animation: ant-rotate 1.2s infinite linear;
+                }
+                .dot i {
+                    position: absolute;
+                    display: block;
+                    width: 14px;
+                    height: 14px;
+                    background-color: #1890ff;
+                    border-radius: 100%;
+                    opacity: 0.3;
+                    transform: scale(0.75);
+                    transform-origin: 50% 50%;
+                    animation: ant-spin-move 1s infinite linear alternate;
+                }
+                .dot i:nth-child(1) {
+                    top: 0;
+                    left: 0;
+                }
+                .dot i:nth-child(2) {
+                    top: 0;
+                    right: 0;
+                    animation-delay: 0.4s;
+                }
+                .dot i:nth-child(3) {
+                    right: 0;
+                    bottom: 0;
+                    animation-delay: 0.8s;
+                }
+                .dot i:nth-child(4) {
+                    bottom: 0;
+                    left: 0;
+                    animation-delay: 1.2s;
+                }
+                @keyframes ant-rotate {
+                    to {
+                        transform: rotate(405deg);
+                    }
+                }
+                @keyframes ant-spin-move {
+                    to {
+                        opacity: 1;
+                    }
+                }
+            </style>
+            <div class="first-loading-wrap">
+                <div class="loading-wrap">
+                    <span class="dot dot-spin">
+                        <i></i>
+                        <i></i>
+                        <i></i>
+                        <i></i>
+                    </span>
+                </div>
+            </div>
+        </div>
+    </body>
 </html>
