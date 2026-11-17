@@ -1,0 +1,20 @@
+{
+  "plugin": "1panel",
+  "name": "1Panel",
+  "id": 99,
+  "version": "1.0.0",
+  "tags": [
+    "tool"
+  ],
+  "timestamp": 1794900000,
+  "desc": "1Panel 运维面板：网站、数据库、容器、文件管理、计划任务与主机监控",
+  "developer": "minas",
+  "publisher": "minas",
+  "changelog": "1.0.0 独立部署的 1Panel v2.5.1 入口（内嵌 18080）",
+  "system": false,
+  "size": 8192,
+  "port": "9304",
+  "type": "standard",
+  "forceupgrade": false,
+  "ext": {}
+}

@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1Panel</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #12161c; overflow: hidden; }
+  #frame { width: 100%; height: 100%; border: 0; display: block; }
+  #veil {
+    position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+    flex-direction: column; gap: 14px; color: #d7dee8;
+    font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: radial-gradient(circle at 50% 35%, #1b2430, #12161c 70%);
+  }
+  #veil.show { display: flex; }
+  #veil .dot { width: 46px; height: 46px; border-radius: 12px; background: #16b981;
+    display: flex; align-items: center; justify-content: center; color: #fff;
+    font-weight: 700; font-size: 20px; letter-spacing: .5px; box-shadow: 0 6px 18px rgba(22,185,129,.28); }
+  #veil h1 { font-size: 16px; font-weight: 600; margin: 0; }
+  #veil p { margin: 0; color: #8b98a8; max-width: 420px; text-align: center; }
+  #veil button { margin-top: 4px; padding: 8px 18px; border-radius: 8px; cursor: pointer;
+    border: 1px solid #2a3542; background: #1b2430; color: #d7dee8; font-size: 13px; }
+  #veil button:hover { border-color: #16b981; color: #16b981; }
+</style>
+</head>
+<body>
+<iframe id="frame" src="" allow="clipboard-read; clipboard-write"></iframe>
+<div id="veil">
+  <div class="dot">1P</div>
+  <h1 id="title">正在连接 1Panel…</h1>
+  <p id="hint">首次加载需要几秒</p>
+  <button id="retry" type="button">重新加载</button>
+</div>
+<script>
+(function () {
+  var frame = document.getElementById('frame');
+  var veil = document.getElementById('veil');
+  var title = document.getElementById('title');
+  var hint = document.getElementById('hint');
+  var retry = document.getElementById('retry');
+  var PANEL_PORT = 18080;
+
+  function panelUrl() {
+    // 插件页与面板同主机，端口不同；用浏览器侧主机名避免写死 IP。
+    var host = location.hostname || '127.0.0.1';
+    return location.protocol + '//' + host + ':' + PANEL_PORT + '/index';
+  }
+
+  function show(msg, tip) {
+    title.textContent = msg;
+    hint.textContent = tip || '';
+    veil.classList.add('show');
+  }
+
+  function hide() { veil.classList.remove('show'); }
+
+  function load() {
+    hide();
+    show('正在连接 1Panel…', '首次加载需要几秒');
+    if (location.protocol === 'https:') {
+      show('当前是 HTTPS 访问', '1Panel 走 HTTP 18080，混合内容会被浏览器拦截。请在局域网内用 http://<NAS地址>:18080/index 访问，或改用面板提供的直连地址。');
+      return;
+    }
+    frame.src = panelUrl();
+    // 面板就绪检测：/health 由插件壳自身提供（探测 127.0.0.1:18080）
+    var tries = 0;
+    (function probe() {
+      tries += 1;
+      fetch('http://' + (location.hostname || '127.0.0.1') + ':9304/health?t=' + Date.now(),
+            { cache: 'no-store' })
+        .then(function (r) { return r.json(); })
+        .then(function (j) {
+          if (j && j.up) { hide(); }
+          else if (tries < 4) { setTimeout(probe, 1200); }
+          else { show('1Panel 还没起来', '面板服务可能正在启动，稍等十几秒后点“重新加载”。'); }
+        })
+        .catch(function () { if (tries < 4) { setTimeout(probe, 1200); } });
+    })();
+    setTimeout(function () {
+      if (!veil.classList.contains('show')) { return; }
+      // 探测成功但页面仍空白：多半是首次编译前端资源，给个提示不遮拦
+      if (frame.src) { hide(); }
+    }, 6000);
+  }
+
+  retry.addEventListener('click', load);
+  load();
+})();
+</script>
+</body>
+</html>

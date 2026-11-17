@@ -1,0 +1,70 @@
+#!/bin/sh
+# 1Panel market-entry plugin: serves a thin wrapper page that embeds the
+# real panel (127.0.0.1:18080). The panel itself is a host service managed
+# by 1panel-core/1panel-agent and is NOT touched here.
+PLUGIN_NAME="1panel"
+PLUG_SRC_DIR="${PLUG_SRC_DIR:-$(cd "$(dirname "$0")/../src" && pwd)}"
+HTTPD="$PLUG_SRC_DIR/files/httpd.py"
+LOGDIR="/tmp/${PLUGIN_NAME}"
+PORT="${PLUG_PORT_ALLOC:-9304}"
+
+_start() {
+    mkdir -p "$LOGDIR"
+    if [ -f "/etc/systemd/system/${PLUGIN_NAME}.service" ]; then
+        systemctl start "${PLUGIN_NAME}.service"; return $?
+    fi
+    PLUG_PORT="$PORT" nohup python3 "$HTTPD" >>"$LOGDIR/server.log" 2>&1 &
+    echo $! > "$LOGDIR/server.pid"
+}
+
+_stop() {
+    [ -f "/etc/systemd/system/${PLUGIN_NAME}.service" ] && \
+        systemctl stop "${PLUGIN_NAME}.service" 2>/dev/null
+    [ -f "$LOGDIR/server.pid" ] && { kill "$(cat "$LOGDIR/server.pid")" 2>/dev/null; rm -f "$LOGDIR/server.pid"; }
+}
+
+case "$1" in
+    preinstall)  mkdir -p "$LOGDIR"; exit 0 ;;
+    postinstall)
+        mkdir -p "$LOGDIR"
+        cat > "/etc/systemd/system/${PLUGIN_NAME}.service" <<UNIT
+[Unit]
+Description=${PLUGIN_NAME} service (1Panel market entry)
+After=network.target 1panel-core.service
+[Service]
+Type=simple
+ExecStart=/bin/sh -c 'exec /usr/bin/python3 ${HTTPD} >>${LOGDIR}/server.log 2>&1'
+Restart=on-failure
+RestartSec=5
+Environment=PLUG_PORT=${PORT}
+[Install]
+WantedBy=multi-user.target
+UNIT
+        systemctl daemon-reload
+        systemctl enable "${PLUGIN_NAME}.service"
+        [ "${PLUG_SKIP_SERVICE_START:-0}" = 1 ] && exit 0
+        _start; exit $? ;;
+    enable|start)  _start; exit $? ;;
+    restart)  _stop; _start; exit $? ;;
+    disable|stop)
+        [ "$PLUG_ACTION" = "uninstall" ] && {
+            systemctl disable "${PLUGIN_NAME}.service" 2>/dev/null
+            rm -f "/etc/systemd/system/${PLUGIN_NAME}.service"
+            systemctl daemon-reload
+        }
+        _stop; exit 0 ;;
+    status)
+        if [ -f "$LOGDIR/server.pid" ] && kill -0 "$(cat "$LOGDIR/server.pid")" 2>/dev/null; then
+            echo "running"; exit 0
+        fi
+        systemctl is-active --quiet "${PLUGIN_NAME}.service" 2>/dev/null && { echo "running"; exit 0; }
+        echo "stopped"; exit 1 ;;
+    preuninstall)  _stop; exit 0 ;;
+    postuninstall)
+        systemctl disable "${PLUGIN_NAME}.service" 2>/dev/null
+        rm -f "/etc/systemd/system/${PLUGIN_NAME}.service"
+        systemctl daemon-reload 2>/dev/null
+        rm -rf "$LOGDIR"; exit 0 ;;
+    preupgrade|postupgrade) exit 0 ;;
+    *) exit 0 ;;
+esac
